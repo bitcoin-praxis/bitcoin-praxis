@@ -401,6 +401,12 @@ func (h *Harness) NewAddress() (address.Address, error) {
 	return h.wallet.NewAddress()
 }
 
+// MiningAddr returns the address used as the coinbase payment destination for
+// blocks generated via the generate RPC / CPU miner.
+func (h *Harness) MiningAddr() address.Address {
+	return h.wallet.coinbaseAddr
+}
+
 // ConfirmedBalance returns the confirmed balance of the Harness' internal
 // wallet.
 //

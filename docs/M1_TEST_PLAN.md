@@ -51,6 +51,7 @@ and the disk-reduction headline.
 | `TestDeleteBlock` | `database/ffldb/deleteblock_test.go` | `DeleteBlock` removes body from index, is idempotent, leaves sibling blocks intact |
 | `TestColdCompactionSurvivesReopen` | `database/ffldb/cold_reopen_test.go` | After compact + close + reopen, block stays cold and FetchBlock matches stripped bytes (post-commit crash recovery) |
 | `TestCreateTxRawResultWitnessExcised` | `witness_excised_rpc_test.go` | Verbose tx JSON sets `witness_excised` for cold loads and does not invent a historical wtxid; `getblock` verbosity 0 refuses cold hex (no flag carrier) |
+| `TestColdRPCSmoke` | `integration/cold_rpc_smoke_test.go` | Live regtest node (`--txindex --addrindex --witness-buffer=8`): cold `getblock` v0 refuses, v1/`getrawtransaction`/`searchrawtransactions` set `witness_excised` |
 | `TestFullBlocks` | `blockchain/fullblocks_test.go` | Consensus suite passes with two-tier storage enabled (`WitnessBuffer=8` so age-out runs during acceptance) |
 | `TestRoundTrip` | `blockcompress/codec_test.go` | `decompress(compress(x)) == x` for representative inputs |
 | `TestDeterminismAcrossInstances` | `blockcompress/codec_test.go` | Two codecs on same version produce identical compressed output |
@@ -117,6 +118,10 @@ go test -run='^$' -fuzz=FuzzColdCompactionOffsets -fuzztime=30s ./blockchain/ind
 go test -run='^$' -fuzz=FuzzColdCompactionTxIndex -fuzztime=30s ./blockchain/indexers/
 # Failing inputs are persisted under blockchain/indexers/testdata/fuzz/ and
 # replayed by `make unit-m1` / `-run=FuzzColdCompaction` (not by plain ./...).
+
+# Live RPC smoke (spawns praxisd; build first or pass an absolute binary path)
+go build -o /tmp/praxisd .
+go test ./integration/ -run TestColdRPCSmoke -count=1 -timeout 180s -v
 ```
 
 ## Tests we ran
@@ -131,6 +136,7 @@ This is evidence, not a substitute for the matrix above.
 | M1 development | Fuzz: `FuzzColdCompactionOffsets`, `FuzzColdCompactionTxIndex` (minutes of `-fuzztime`) | Pass |
 | Post M1 | Testnet4 IBD with parallel block fetch to tip (~144k) | ~4.8 blk/s overall on soak host |
 | Post M1 | Simnet LN cold soak vs excised witness (CSV ≪ `--witness-buffer`): warm/cold pay, coop close, force close, SCB restore | Pass |
+| 2026-07-20 | `TestColdRPCSmoke` (regtest + txindex/addrindex past buffer) | Pass |
 
 **Still planned:** longer mainnet IBD soak; M2 IBD replay benchmark; broader LN
 soak matrix; M3 Bitcoin-Praxis Wallet / GUI acceptance tests (see ROADMAP).

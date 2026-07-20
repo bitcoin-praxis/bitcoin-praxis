@@ -119,9 +119,9 @@ go test -run='^$' -fuzz=FuzzColdCompactionTxIndex -fuzztime=30s ./blockchain/ind
 # Failing inputs are persisted under blockchain/indexers/testdata/fuzz/ and
 # replayed by `make unit-m1` / `-run=FuzzColdCompaction` (not by plain ./...).
 
-# Live RPC smoke (spawns praxisd; build first or pass an absolute binary path)
-go build -o /tmp/praxisd .
-go test ./integration/ -run TestColdRPCSmoke -count=1 -timeout 180s -v
+# Live RPC smoke (//go:build rpctest; harness compiles praxisd on demand).
+# make unit already includes this via -tags=rpctest.
+go test -tags=rpctest ./integration/ -run TestColdRPCSmoke -count=1 -timeout 180s -v
 ```
 
 ## Tests we ran

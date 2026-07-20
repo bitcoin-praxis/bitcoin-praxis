@@ -2,6 +2,10 @@
 // Use of this source code is governed by an ISC
 // license that can be found in the LICENSE file.
 
+// This file is ignored during the regular tests due to the following build tag.
+//go:build rpctest
+// +build rpctest
+
 package integration
 
 import (
@@ -19,6 +23,9 @@ import (
 //   - getblock verbosity=1 sets witness_excised
 //   - getrawtransaction verbose sets witness_excised for a cold-height tx
 //   - searchrawtransactions still resolves the mining address
+//
+// Empty exe path lets rpctest compile the current tree on demand (same as the
+// other //go:build rpctest harnesses). Hardcoding /tmp/praxisd breaks CI.
 func TestColdRPCSmoke(t *testing.T) {
 	const buffer = 8
 	extra := []string{
@@ -26,7 +33,7 @@ func TestColdRPCSmoke(t *testing.T) {
 		"--addrindex",
 		"--witness-buffer=8",
 	}
-	r, err := rpctest.New(&chaincfg.RegressionNetParams, nil, extra, "/tmp/praxisd")
+	r, err := rpctest.New(&chaincfg.RegressionNetParams, nil, extra, "")
 	if err != nil {
 		t.Fatalf("New harness: %v", err)
 	}

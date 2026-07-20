@@ -38,11 +38,11 @@ import (
 )
 
 const (
-	defaultConfigFilename        = "btcd.conf"
+	defaultConfigFilename        = "praxisd.conf"
 	defaultDataDirname           = "data"
 	defaultLogLevel              = "info"
 	defaultLogDirname            = "logs"
-	defaultLogFilename           = "btcd.log"
+	defaultLogFilename           = "praxisd.log"
 	defaultMaxPeers              = 125
 	defaultBanDuration           = time.Hour * 24
 	defaultBanThreshold          = 100
@@ -66,14 +66,22 @@ const (
 	defaultMaxOrphanTxSize       = 100000
 	defaultSigCacheMaxSize       = 100000
 	defaultUtxoCacheMaxSizeMiB   = 250
-	sampleConfigFilename         = "sample-btcd.conf"
+	sampleConfigFilename         = "sample-praxisd.conf"
 	defaultTxIndex               = false
 	defaultAddrIndex             = false
 	pruneMinSize                 = 1536
+
+	// defaultWitnessBuffer is the default number of recent blocks kept in the
+	// hot tier (full, with witness, uncompressed) before age-out compaction
+	// moves them to the cold tier (witness-stripped, zstd-compressed). 2016
+	// blocks is roughly two weeks and covers common reorg assumptions and
+	// typical LN delays; use a larger buffer or --witness-buffer=0 if you
+	// require longer witness retention. See docs/ROADMAP.md, M1.
+	defaultWitnessBuffer          = 2016
 )
 
 var (
-	defaultHomeDir     = btcutil.AppDataDir("btcd", false)
+	defaultHomeDir     = btcutil.AppDataDir("praxisd", false)
 	defaultConfigFile  = filepath.Join(defaultHomeDir, defaultConfigFilename)
 	defaultDataDir     = filepath.Join(defaultHomeDir, defaultDataDirname)
 	knownDbTypes       = database.SupportedDrivers()
@@ -95,15 +103,15 @@ func minUint32(a, b uint32) uint32 {
 	return b
 }
 
-// config defines the configuration options for btcd.
+// config defines the configuration options for praxisd.
 //
 // See loadConfig for details on the configuration load process.
 type config struct {
 	AddCheckpoints       []string      `long:"addcheckpoint" description:"Add a custom checkpoint.  Format: '<height>:<hash>'"`
 	AddPeers             []string      `short:"a" long:"addpeer" description:"Add a peer to connect with at startup"`
 	AddrIndex            bool          `long:"addrindex" description:"Maintain a full address-based transaction index which makes the searchrawtransactions RPC available"`
-	AgentBlacklist       []string      `long:"agentblacklist" description:"A comma separated list of user-agent substrings which will cause btcd to reject any peers whose user-agent contains any of the blacklisted substrings."`
-	AgentWhitelist       []string      `long:"agentwhitelist" description:"A comma separated list of user-agent substrings which will cause btcd to require all peers' user-agents to contain one of the whitelisted substrings. The blacklist is applied before the whitelist, and an empty whitelist will allow all agents that do not fail the blacklist."`
+	AgentBlacklist       []string      `long:"agentblacklist" description:"A comma separated list of user-agent substrings which will cause praxisd to reject any peers whose user-agent contains any of the blacklisted substrings."`
+	AgentWhitelist       []string      `long:"agentwhitelist" description:"A comma separated list of user-agent substrings which will cause praxisd to require all peers' user-agents to contain one of the whitelisted substrings. The blacklist is applied before the whitelist, and an empty whitelist will allow all agents that do not fail the blacklist."`
 	BanDuration          time.Duration `long:"banduration" description:"How long to ban misbehaving peers.  Valid time units are {s, m, h}.  Minimum 1 second"`
 	BanThreshold         uint32        `long:"banthreshold" description:"Maximum allowed ban score before disconnecting and banning misbehaving peers."`
 	BlockMaxSize         uint32        `long:"blockmaxsize" description:"Maximum block size in bytes to be used when creating a block"`
@@ -183,6 +191,7 @@ type config struct {
 	Upnp                 bool          `long:"upnp" description:"Use UPnP to map our listening port outside of NAT"`
 	ShowVersion          bool          `short:"V" long:"version" description:"Display version information and exit"`
 	Whitelists           []string      `long:"whitelist" description:"Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or ::1)"`
+	WitnessBuffer         int32         `long:"witness-buffer" description:"Number of recent blocks to keep with full witness data before age-out compaction excises witness and compresses older blocks. Default 2016 (~2 weeks). 0 disables compaction (full archival node). Distinct from --prune, which deletes old blocks entirely."`
 	lookup               func(string) ([]net.IP, error)
 	oniondial            func(string, string, time.Duration) (net.Conn, error)
 	dial                 func(string, string, time.Duration) (net.Conn, error)
@@ -411,7 +420,7 @@ func newConfigParser(cfg *config, so *serviceOptions, options flags.Options) *fl
 //  3. Load configuration file overwriting defaults with any specified options
 //  4. Parse CLI options and overwrite/add any specified options
 //
-// The above results in btcd functioning properly without any config settings
+// The above results in praxisd functioning properly without any config settings
 // while still allowing the user to override settings with config files and
 // command line options.  Command line options always take precedence.
 func loadConfig() (*config, []string, error) {
@@ -445,6 +454,7 @@ func loadConfig() (*config, []string, error) {
 		TxIndex:              defaultTxIndex,
 		AddrIndex:            defaultAddrIndex,
 		V2Transport:          false,
+		WitnessBuffer:        defaultWitnessBuffer,
 	}
 
 	// Service options which are only added on Windows.
@@ -1170,6 +1180,25 @@ func loadConfig() (*config, []string, error) {
 		return nil, nil, err
 	}
 
+	// --prune deletes historical blocks entirely, so it is incompatible with
+	// witness-buffer cold-tier retention. When prune is enabled, force the
+	// witness buffer off (including the non-zero default) rather than making
+	// callers also pass --witness-buffer=0.
+	if cfg.Prune != 0 && cfg.WitnessBuffer != 0 {
+		btcdLog.Warnf("--prune is set; disabling --witness-buffer " +
+			"(cold-tier excision is incompatible with block deletion)")
+		cfg.WitnessBuffer = 0
+	}
+
+	// A negative witness buffer makes no sense.
+	if cfg.WitnessBuffer < 0 {
+		err := fmt.Errorf("%s: the --witness-buffer option may not be "+
+			"negative. Got %d", funcName, cfg.WitnessBuffer)
+		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, usageMessage)
+		return nil, nil, err
+	}
+
 	// Warn about missing config file only after all other configuration is
 	// done.  This prevents the warning on help messages and invalid
 	// options.  Note this should go directly before the return.
@@ -1180,7 +1209,7 @@ func loadConfig() (*config, []string, error) {
 	return &cfg, remainingArgs, nil
 }
 
-// createDefaultConfig copies the file sample-btcd.conf to the given destination path,
+// createDefaultConfig copies the file sample-praxisd.conf to the given destination path,
 // and populates it with some randomly generated RPC username and password.
 func createDefaultConfigFile(destinationPath string) error {
 	// Create the destination directory if it does not exists

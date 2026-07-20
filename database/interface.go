@@ -229,6 +229,17 @@ type Tx interface {
 	// Other errors are possible depending on the implementation.
 	StoreBlock(block *btcutil.Block) error
 
+	// DeleteBlock removes the block body for the given hash from block
+	// storage. Chain-index headers and validation status are the caller's
+	// responsibility. Missing blocks are a no-op (idempotent). Flat-file
+	// bytes may remain until a later reclaim/prune of the containing file.
+	//
+	// The interface contract guarantees at least the following errors will
+	// be returned (other implementation-specific errors are possible):
+	//   - ErrTxNotWritable if attempted against a read-only transaction
+	//   - ErrTxClosed if the transaction has already been closed
+	DeleteBlock(hash *chainhash.Hash) error
+
 	// HasBlock returns whether or not a block with the given hash exists
 	// in the database.
 	//
@@ -426,6 +437,56 @@ type Tx interface {
 	// block storage.  Calling this function on a managed transaction will
 	// result in a panic.
 	Rollback() error
+}
+
+// ColdCompactor is an optional interface implemented by database backends that
+// support witness-separated cold-tier storage (see docs/ROADMAP.md, M1). A Tx
+// that also implements ColdCompactor can move a block from the hot tier (full,
+// uncompressed, with witness) to the cold tier (witness-stripped,
+// zstd-compressed) and update its block-index location atomically.
+//
+// Callers should type-assert: `cc, ok := tx.(database.ColdCompactor); if ok { ... }`.
+// Backends without cold-tier support simply do not implement this interface.
+type ColdCompactor interface {
+	// StoreBlockCold stores the block directly into the cold tier (witness
+	// stripped, zstd-compressed) without ever writing a hot copy. Used during
+	// IBD when the headers tip already implies the block sits past the witness
+	// buffer. The cold write is deferred to transaction commit.
+	//
+	// Returns the same errors as StoreBlock for existence / writability /
+	// closed-tx cases.
+	StoreBlockCold(block *btcutil.Block) error
+
+	// CompactBlockToCold moves the block identified by hash from the hot tier
+	// to the cold tier. If the block is already cold, it is an idempotent
+	// no-op and returns nil — callers rely on this to proceed with
+	// post-compaction bookkeeping (rewriting offset-bearing index entries)
+	// unconditionally, which is important when a reorg reconnects a block
+	// that was already cold. The cold write is deferred to transaction
+	// commit, so a rolled-back transaction leaves no orphaned cold data.
+	CompactBlockToCold(hash *chainhash.Hash) error
+
+	// CancelPendingColdCompaction drops a cold write scheduled in this
+	// transaction (StoreBlockCold or CompactBlockToCold) so commit leaves
+	// the prior on-disk state. Used when post-compaction index rewrite
+	// fails and the block must stay hot with witness-relative indexes.
+	CancelPendingColdCompaction(hash *chainhash.Hash) error
+
+	// IsColdBlock reports whether the block identified by hash is stored in
+	// the cold tier (witness stripped). It returns false when the block is
+	// unknown or still hot. Pending cold writes in this transaction are
+	// treated as cold so callers see the post-commit state.
+	IsColdBlock(hash *chainhash.Hash) (bool, error)
+
+	// ReclaimHotSpace deletes hot-tier block files whose blocks have all been
+	// compacted to the cold tier. It scans the block index for the lowest hot
+	// file number still in use and deletes all hot files below it. Block index
+	// entries are NOT deleted (they now point to cold locations). Returns the
+	// number of bytes reclaimed.
+	//
+	// This is an O(n) scan of the block index, so callers should invoke it
+	// periodically (e.g. once per difficulty period) rather than per block.
+	ReclaimHotSpace() (uint64, error)
 }
 
 // DB provides a generic interface that is used to store bitcoin blocks and

@@ -338,6 +338,21 @@ func rpcNoTxInfoError(txHash *chainhash.Hash) *btcjson.RPCError {
 			txHash))
 }
 
+// rpcChainRuleError maps blockchain rule failures (including ErrWitnessExcised)
+// to a JSON-RPC error clients can display. Non-rule errors become internal.
+func rpcChainRuleError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if ruleErr, ok := err.(blockchain.RuleError); ok {
+		return &btcjson.RPCError{
+			Code:    btcjson.ErrRPCVerify,
+			Message: ruleErr.Description,
+		}
+	}
+	return internalRPCError(err.Error(), "")
+}
+
 // gbtWorkState houses state that is used in between multiple RPC invocations to
 // getblocktemplate.
 type gbtWorkState struct {
@@ -744,27 +759,38 @@ func createVoutList(mtx *wire.MsgTx, chainParams *chaincfg.Params, filterAddrMap
 }
 
 // createTxRawResult converts the passed transaction and associated parameters
-// to a raw transaction JSON object.
+// to a raw transaction JSON object. When witnessExcised is true the tx was
+// loaded from a cold-tier (witness-stripped) block: Hash is set to the txid
+// (historical wtxid is unavailable), size metrics describe the stripped
+// serialization, and WitnessExcised is set so clients do not treat the result
+// as a full historical witness view.
 func createTxRawResult(chainParams *chaincfg.Params, mtx *wire.MsgTx,
 	txHash string, blkHeader *wire.BlockHeader, blkHash string,
-	blkHeight int32, chainHeight int32) (*btcjson.TxRawResult, error) {
+	blkHeight int32, chainHeight int32, witnessExcised bool) (*btcjson.TxRawResult, error) {
 
 	mtxHex, err := messageToHex(mtx)
 	if err != nil {
 		return nil, err
 	}
 
+	hashStr := mtx.WitnessHash().String()
+	if witnessExcised {
+		// Without witness bytes WitnessHash equals TxHash; be explicit.
+		hashStr = txHash
+	}
+
 	txReply := &btcjson.TxRawResult{
-		Hex:      mtxHex,
-		Txid:     txHash,
-		Hash:     mtx.WitnessHash().String(),
-		Size:     int32(mtx.SerializeSize()),
-		Vsize:    int32(mempool.GetTxVirtualSize(btcutil.NewTx(mtx))),
-		Weight:   int32(blockchain.GetTransactionWeight(btcutil.NewTx(mtx))),
-		Vin:      createVinList(mtx),
-		Vout:     createVoutList(mtx, chainParams, nil),
-		Version:  uint32(mtx.Version),
-		LockTime: mtx.LockTime,
+		Hex:           mtxHex,
+		Txid:          txHash,
+		Hash:          hashStr,
+		Size:          int32(mtx.SerializeSize()),
+		Vsize:         int32(mempool.GetTxVirtualSize(btcutil.NewTx(mtx))),
+		Weight:        int32(blockchain.GetTransactionWeight(btcutil.NewTx(mtx))),
+		Vin:           createVinList(mtx),
+		Vout:          createVoutList(mtx, chainParams, nil),
+		Version:       uint32(mtx.Version),
+		LockTime:      mtx.LockTime,
+		WitnessExcised: witnessExcised,
 	}
 
 	if blkHeader != nil {
@@ -776,6 +802,24 @@ func createTxRawResult(chainParams *chaincfg.Params, mtx *wire.MsgTx,
 	}
 
 	return txReply, nil
+}
+
+// dbBlockIsCold reports whether hash is stored in the cold (witness-stripped)
+// tier. Backends without ColdCompactor return false, nil. Database errors are
+// returned to the caller — do not treat them as "not cold" (that would omit
+// witness_excised and can mis-serve stripped data).
+func dbBlockIsCold(db database.DB, hash *chainhash.Hash) (bool, error) {
+	var cold bool
+	err := db.View(func(dbTx database.Tx) error {
+		cc, ok := dbTx.(database.ColdCompactor)
+		if !ok {
+			return nil
+		}
+		var err error
+		cold, err = cc.IsColdBlock(hash)
+		return err
+	})
+	return cold, err
 }
 
 // handleDecodeRawTransaction handles decoderawtransaction commands.
@@ -1093,7 +1137,24 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		}
 	}
 	// If verbosity is 0, return the serialized block as a hex encoded string.
+	// Cold (witness-stripped) blocks cannot safely use this path: callers would
+	// receive stripped hex with no witness_excised signal. Refuse and point
+	// them at verbosity >= 1 (JSON includes the flag) or --witness-buffer=0.
 	if c.Verbosity != nil && *c.Verbosity == 0 {
+		cold, err := dbBlockIsCold(s.cfg.DB, hash)
+		if err != nil {
+			context := "Failed to check cold-tier status"
+			return nil, internalRPCError(err.Error(), context)
+		}
+		if cold {
+			return nil, &btcjson.RPCError{
+				Code: btcjson.ErrRPCMisc,
+				Message: "Block witness data has been excised by cold-tier " +
+					"compaction; use verbosity >= 1 (includes " +
+					"witness_excised) or run with --witness-buffer=0 " +
+					"for archival hex",
+			}
+		}
 		return hex.EncodeToString(blkBytes), nil
 	}
 
@@ -1128,6 +1189,11 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 
 	params := s.cfg.ChainParams
 	blockHeader := &blk.MsgBlock().Header
+	witnessExcised, err := dbBlockIsCold(s.cfg.DB, hash)
+	if err != nil {
+		context := "Failed to check cold-tier status"
+		return nil, internalRPCError(err.Error(), context)
+	}
 	blockReply := btcjson.GetBlockVerboseResult{
 		Hash:          c.Hash,
 		Version:       blockHeader.Version,
@@ -1144,6 +1210,7 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		Bits:          strconv.FormatInt(int64(blockHeader.Bits), 16),
 		Difficulty:    getDifficultyRatio(blockHeader.Bits, params),
 		NextHash:      nextHashString,
+		WitnessExcised: witnessExcised,
 	}
 
 	if *c.Verbosity == 1 {
@@ -1160,7 +1227,7 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		for i, tx := range txns {
 			rawTxn, err := createTxRawResult(params, tx.MsgTx(),
 				tx.Hash().String(), blockHeader, hash.String(),
-				blockHeight, best.Height)
+				blockHeight, best.Height, witnessExcised)
 			if err != nil {
 				return nil, err
 			}
@@ -2731,8 +2798,17 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
 		chainHeight = s.cfg.Chain.BestSnapshot().Height
 	}
 
+	var witnessExcised bool
+	if blkHash != nil {
+		var err error
+		witnessExcised, err = dbBlockIsCold(s.cfg.DB, blkHash)
+		if err != nil {
+			context := "Failed to check cold-tier status"
+			return nil, internalRPCError(err.Error(), context)
+		}
+	}
 	rawTxn, err := createTxRawResult(s.cfg.ChainParams, mtx, txHash.String(),
-		blkHeader, blkHashStr, blkHeight, chainHeight)
+		blkHeader, blkHashStr, blkHeight, chainHeight, witnessExcised)
 	if err != nil {
 		return nil, err
 	}
@@ -2869,7 +2945,7 @@ func handleInvalidateBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 	}
 
 	err = s.cfg.Chain.InvalidateBlock(invalidateHash)
-	return nil, err
+	return nil, rpcChainRuleError(err)
 }
 
 // handleHelp implements the help command.
@@ -3161,7 +3237,7 @@ func handleReconsiderBlock(s *rpcServer, cmd interface{}, closeChan <-chan struc
 	}
 
 	err = s.cfg.Chain.ReconsiderBlock(reconsiderHash)
-	return nil, err
+	return nil, rpcChainRuleError(err)
 }
 
 // handleSearchRawTransactions implements the searchrawtransactions command.
@@ -3376,6 +3452,10 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		result := &srtList[i]
 		result.Hex = hexTxns[i]
 		result.Txid = mtx.TxHash().String()
+		result.Hash = mtx.WitnessHash().String()
+		result.Size = strconv.Itoa(mtx.SerializeSize())
+		result.Vsize = strconv.Itoa(int(mempool.GetTxVirtualSize(btcutil.NewTx(mtx))))
+		result.Weight = strconv.Itoa(int(blockchain.GetTransactionWeight(btcutil.NewTx(mtx))))
 		result.Vin, err = createVinListPrevOut(s, mtx, params, vinExtra,
 			filterAddrMap)
 		if err != nil {
@@ -3412,6 +3492,14 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 			blkHeader = &header
 			blkHashStr = blkHash.String()
 			blkHeight = height
+
+			if cold, err := dbBlockIsCold(s.cfg.DB, blkHash); err != nil {
+				context := "Failed to check cold-tier status"
+				return nil, internalRPCError(err.Error(), context)
+			} else if cold {
+				result.WitnessExcised = true
+				result.Hash = result.Txid
+			}
 		}
 
 		// Add the block information to the result if there is any.
@@ -3609,7 +3697,7 @@ func handleStop(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (inter
 	case s.requestProcessShutdown <- struct{}{}:
 	default:
 	}
-	return "btcd stopping.", nil
+	return "praxisd stopping.", nil
 }
 
 // handleSubmitBlock implements the submitblock command.

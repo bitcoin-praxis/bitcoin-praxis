@@ -63,7 +63,7 @@ const (
 var (
 	// userAgentName is the user agent name and is used to help identify
 	// ourselves to other bitcoin peers.
-	userAgentName = "btcd"
+	userAgentName = "praxisd"
 
 	// userAgentVersion is the user agent version and is used to help
 	// identify ourselves to other bitcoin peers.
@@ -834,6 +834,12 @@ func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
 		return s.pushTxMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
 
 	case wire.InvTypeWitnessBlock:
+		if s.blockWitnessExcised(&iv.Hash) {
+			if doneChan != nil {
+				doneChan <- struct{}{}
+			}
+			return errWitnessExcisedInv
+		}
 		return s.pushBlockMsg(
 			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
 		)
@@ -842,6 +848,12 @@ func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
 		return s.pushBlockMsg(sp, &iv.Hash, doneChan, wire.BaseEncoding)
 
 	case wire.InvTypeFilteredWitnessBlock:
+		if s.blockWitnessExcised(&iv.Hash) {
+			if doneChan != nil {
+				doneChan <- struct{}{}
+			}
+			return errWitnessExcisedInv
+		}
 		return s.pushMerkleBlockMsg(
 			sp, &iv.Hash, doneChan, wire.WitnessEncoding,
 		)
@@ -860,6 +872,32 @@ func (s *server) pushInventory(sp *serverPeer, iv *wire.InvVect,
 
 		return errors.New("unknown inventory type")
 	}
+}
+
+// errWitnessExcisedInv is returned from pushInventory when a peer requests
+// witness inventory for a cold-tier block. OnGetData turns it into notfound.
+var errWitnessExcisedInv = errors.New("witness data excised for inventory")
+
+// blockWitnessExcised reports whether the block is in the cold tier. On
+// database error it returns true so callers fail closed (notfound) instead of
+// serving stripped bytes on a witness encoding path.
+func (s *server) blockWitnessExcised(hash *chainhash.Hash) bool {
+	var cold bool
+	err := s.db.View(func(dbTx database.Tx) error {
+		cc, ok := dbTx.(database.ColdCompactor)
+		if !ok {
+			return nil
+		}
+		var err error
+		cold, err = cc.IsColdBlock(hash)
+		return err
+	})
+	if err != nil {
+		srvrLog.Errorf("IsColdBlock %s failed: %v; treating as excised",
+			hash, err)
+		return true
+	}
+	return cold
 }
 
 // OnGetBlocks is invoked when a peer receives a getblocks bitcoin
@@ -2876,6 +2914,10 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 	if cfg.Prune != 0 {
 		services &^= wire.SFNodeNetwork
 	}
+	// Witness-buffer compaction keeps full witness for the hot window and
+	// strips it for cold heights. The node still advertises NODE_WITNESS so
+	// peers can fetch recent (hot) witness blocks. Cold MSG_WITNESS_BLOCK
+	// requests are answered with notfound (see pushInventory).
 	if !cfg.V2Transport {
 		services &^= wire.SFNodeP2PV2
 	}
@@ -2991,6 +3033,7 @@ func newServer(listenAddrs, agentBlacklist, agentWhitelist []string,
 		HashCache:        s.hashCache,
 		Prune:            cfg.Prune * 1024 * 1024,
 		UtxoCacheMaxSize: uint64(cfg.UtxoCacheMaxSizeMiB) * 1024 * 1024,
+		WitnessBuffer:    cfg.WitnessBuffer,
 	})
 	if err != nil {
 		return nil, err

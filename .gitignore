@@ -49,10 +49,12 @@ coverage.txt.bak
 
 # Binaries produced by "make build"
 /addblock
-/btcctl
-/btcd
+/praxctl
+/praxisd
 /findcheckpoint
 /gencerts
 
 .DS_Store
 .aider*
+ln-soak-cold/*
+bin/*

@@ -229,6 +229,10 @@ const (
 	// been found to violate a consensus rule, as opposed to having an
 	// invalid ancestor.
 	ErrKnownInvalidBlock
+
+	// ErrWitnessExcised indicates an operation requires witness data that
+	// has been stripped by cold-tier compaction (see --witness-buffer).
+	ErrWitnessExcised
 )
 
 // Map of ErrorCode values back to their constant names for pretty printing.
@@ -276,7 +280,9 @@ var errorCodeStrings = map[ErrorCode]string{
 	ErrPreviousBlockUnknown:      "ErrPreviousBlockUnknown",
 	ErrInvalidAncestorBlock:      "ErrInvalidAncestorBlock",
 	ErrPrevBlockNotBest:          "ErrPrevBlockNotBest",
+	ErrTimewarpAttack:            "ErrTimewarpAttack",
 	ErrKnownInvalidBlock:         "ErrKnownInvalidBlock",
+	ErrWitnessExcised:             "ErrWitnessExcised",
 }
 
 // String returns the ErrorCode as a human-readable name.

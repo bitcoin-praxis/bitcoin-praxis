@@ -64,26 +64,26 @@ goimports:
 #? build: Build all binaries, place them in project directory
 build:
 	@$(call print, "Building all binaries")
-	$(GOBUILD) $(PKG)
-	$(GOBUILD) $(PKG)/cmd/btcctl
-	$(GOBUILD) $(PKG)/cmd/gencerts
-	$(GOBUILD) $(PKG)/cmd/findcheckpoint
-	$(GOBUILD) $(PKG)/cmd/addblock
+	$(GOBUILD) -o praxisd $(PKG)
+	$(GOBUILD) -o praxctl $(PKG)/cmd/praxctl
+	$(GOBUILD) -o gencerts $(PKG)/cmd/gencerts
+	$(GOBUILD) -o findcheckpoint $(PKG)/cmd/findcheckpoint
+	$(GOBUILD) -o addblock $(PKG)/cmd/addblock
 
 #? install: Install all binaries, place them in $GOPATH/bin
 install:
 	@$(call print, "Installing all binaries")
-	$(GOINSTALL) $(PKG)
-	$(GOINSTALL) $(PKG)/cmd/btcctl
+	$(GOBUILD) -o $(GO_BIN)/praxisd $(PKG)
+	$(GOBUILD) -o $(GO_BIN)/praxctl $(PKG)/cmd/praxctl
 	$(GOINSTALL) $(PKG)/cmd/gencerts
 	$(GOINSTALL) $(PKG)/cmd/findcheckpoint
 	$(GOINSTALL) $(PKG)/cmd/addblock
 
-#? release-install: Install btcd and btcctl release binaries, place them in $GOBIN
+#? release-install: Install praxisd and praxctl release binaries, place them in $GOBIN
 release-install:
-	@$(call print, "Installing btcd and btcctl release binaries")
-	env CGO_ENABLED=0 $(GOINSTALL) -trimpath -ldflags="-s -w -buildid=" $(PKG)
-	env CGO_ENABLED=0 $(GOINSTALL) -trimpath -ldflags="-s -w -buildid=" $(PKG)/cmd/btcctl
+	@$(call print, "Installing praxisd and praxctl release binaries")
+	env CGO_ENABLED=0 $(GOBUILD) -o $(GO_BIN)/praxisd -trimpath -ldflags="-s -w -buildid=" $(PKG)
+	env CGO_ENABLED=0 $(GOBUILD) -o $(GO_BIN)/praxctl -trimpath -ldflags="-s -w -buildid=" $(PKG)/cmd/praxctl
 
 # =======
 # TESTING
@@ -134,6 +134,18 @@ unit-race:
 	cd psbt && env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(GOTEST) -race -test.timeout=20m ./...
 	cd wire && env CGO_ENABLED=1 GORACE="history_size=7 halt_on_errors=1" $(GOTEST) -race -test.timeout=20m ./...
 
+#? unit-m1: Run M1 witness-buffer / cold-tier / index-rewrite regressions (incl. fuzz seed corpus)
+# FuzzXxx seed corpora are NOT executed by plain `go test ./...`; they need -run=Fuzz.
+unit-m1:
+	@$(call print, "Running M1 cold-tier and index-rewrite regressions.")
+	$(GOTEST) -race -timeout=10m \
+		./database/ffldb/ \
+		./blockcompress/ \
+		./blockchain/ \
+		./blockchain/indexers/
+	@$(call print, "Replaying cold-compaction fuzz seed corpora.")
+	$(GOTEST) -race -timeout=5m -run='FuzzColdCompaction' ./blockchain/indexers/
+
 # =========
 # UTILITIES
 # =========
@@ -175,7 +187,7 @@ tidy-module:
 
 #? help: Get more info on make commands
 help: Makefile
-	@echo " Choose a command run in btcd:"
+	@echo " Choose a command run in Bitcoin-Praxis:"
 	@sed -n 's/^#?//p' $< | column -t -s ':' |  sort | sed -e 's/^/ /'
 
 .PHONY: help

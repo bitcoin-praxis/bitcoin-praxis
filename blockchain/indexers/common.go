@@ -10,10 +10,12 @@ package indexers
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/database"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 var (
@@ -26,10 +28,61 @@ var (
 	errInterruptRequested = errors.New("interrupt requested")
 )
 
+// blockTxLocs returns transaction locations for indexing. When the block is
+// already cold (StoreBlockCold or prior compaction), locations are relative to
+// the stripped serialization so FetchBlockRegion works without a later rewrite.
+func blockTxLocs(dbTx database.Tx, block *btcutil.Block) ([]wire.TxLoc, error) {
+	if cc, ok := dbTx.(database.ColdCompactor); ok {
+		cold, err := cc.IsColdBlock(block.Hash())
+		if err != nil {
+			return nil, err
+		}
+		if cold {
+			return strippedTxLocs(block)
+		}
+	}
+	return block.TxLoc()
+}
+
+// strippedTxLocs returns TxLoc relative to SerializeNoWitness bytes.
+func strippedTxLocs(block *btcutil.Block) ([]wire.TxLoc, error) {
+	strippedBytes, err := block.BytesNoWitness()
+	if err != nil {
+		return nil, fmt.Errorf("serialize stripped block %s: %w",
+			block.Hash(), err)
+	}
+	strippedBlock, err := btcutil.NewBlockFromBytes(strippedBytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse stripped block %s: %w",
+			block.Hash(), err)
+	}
+	return strippedBlock.TxLoc()
+}
+
 // NeedsInputser provides a generic interface for an indexer to specify the it
 // requires the ability to look up inputs for a transaction.
 type NeedsInputser interface {
 	NeedsInputs() bool
+}
+
+// OffsetRewriter is implemented by indexers that store block-relative byte
+// offsets (e.g. the transaction index and the address index, which store
+// wire.TxLoc.TxStart/TxLen per entry). When a block is compacted from the hot
+// tier (stored with witness) to the cold tier (stored stripped), those offsets
+// change because witness bytes are removed. The index manager calls
+// RewriteTxOffsetsForColdCompaction for every enabled indexer implementing this
+// interface, in the same database transaction as CompactBlockToCold, so the
+// offset entries are rewritten to the stripped serialization's offset space.
+//
+// The block is still readable as its full (hot) serialization during the
+// transaction; the implementation re-derives TxLoc from the stripped
+// serialization and overwrites the existing entries. stxos is nil when the
+// spend journal entry is unavailable; implementations that require it
+// (e.g. the address index) must refuse rather than leave stale offsets.
+// The chain layer skips compaction when the journal is missing.
+type OffsetRewriter interface {
+	RewriteTxOffsetsForColdCompaction(dbTx database.Tx, block *btcutil.Block,
+		stxos []blockchain.SpentTxOut) error
 }
 
 // Indexer provides a generic interface for an indexer that is managed by an

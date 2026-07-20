@@ -540,6 +540,78 @@ func dbRemoveAddrIndexEntries(bucket internalBucket, addrKey [addrKeySize]byte,
 	return applyPending()
 }
 
+// dbUpdateAddrIndexOffsetsForBlock scans all levels for the given address key,
+// finds entries whose block ID matches blockID, and rewrites their stored
+// txStart/txLen from the witness-relative offsets to the stripped-relative
+// offsets given in oldToNew (keyed by the old txStart). It is used by the cold
+// compaction path to fix address-index entries after a block is compacted from
+// the hot tier (witness-included) to the cold tier (witness-stripped).
+//
+// Unlike dbRemoveAddrIndexEntries, which removes from the end (valid for
+// disconnect because the disconnected block is the tip), this function updates
+// entries in place regardless of their position in the level structure — the
+// compacted block is typically an old block in the middle of the chain, so its
+// entries are not at the end.
+//
+// The level structure itself is not reshaped: only the 12-byte entry payloads
+// whose block ID matches are rewritten. The entry count, level occupancy, and
+// ordering are unchanged, so the level invariants (each level is empty, half
+// full, or completely full) still hold.
+func dbUpdateAddrIndexOffsetsForBlock(bucket internalBucket, addrKey [addrKeySize]byte,
+	blockID uint32, blockHash *chainhash.Hash, oldToNew map[uint32]wire.TxLoc) error {
+
+	for level := uint8(0); ; level++ {
+		levelKey := keyForLevel(addrKey, level)
+		levelData := bucket.Get(levelKey[:])
+		if len(levelData) == 0 {
+			// No data at this level, and since levels are contiguous
+			// from 0, there is nothing at any higher level either.
+			return nil
+		}
+
+		// Scan the level data in 12-byte entries. Match by blockID, then
+		// look up the old txStart in oldToNew to find the replacement
+		// TxLoc. Entries that don't match the block ID are left alone.
+		modified := false
+		for offset := 0; offset+txEntrySize <= len(levelData); offset += txEntrySize {
+			entryBlockID := byteOrder.Uint32(levelData[offset : offset+4])
+			if entryBlockID != blockID {
+				continue
+			}
+			oldTxStart := byteOrder.Uint32(levelData[offset+4 : offset+8])
+			newLoc, ok := oldToNew[oldTxStart]
+			if !ok {
+				// Matched this block but the stored offset is not in the
+				// rewrite map. Failing here lets connectBlock cancel the
+				// pending cold write and leave the block hot with intact
+				// witness-relative indexes. Silently continuing would
+				// commit cold with stale offsets for searchrawtransactions.
+				return fmt.Errorf("addrindex cold rewrite: block %d (%s) "+
+					"addr entry has tx offset %d not found in rewrite map "+
+					"(level %d, entry offset %d)",
+					blockID, blockHash, oldTxStart, level, offset)
+			}
+			// Copy the level data before mutating if this is the first
+			// modification in this level: bucket.Get may return a
+			// reference into the db buffer that must not be written.
+			if !modified {
+				levelData = append([]byte(nil), levelData...)
+				modified = true
+			}
+			byteOrder.PutUint32(levelData[offset+4:offset+8],
+				uint32(newLoc.TxStart))
+			byteOrder.PutUint32(levelData[offset+8:offset+12],
+				uint32(newLoc.TxLen))
+		}
+
+		if modified {
+			if err := bucket.Put(levelKey[:], levelData); err != nil {
+				return err
+			}
+		}
+	}
+}
+
 // addrToKey converts known address types to an addrindex key.  An error is
 // returned for unsupported types.
 func addrToKey(addr address.Address) ([addrKeySize]byte, error) {
@@ -727,16 +799,26 @@ func (idx *AddrIndex) indexBlock(data writeIndexData, block *btcutil.Block,
 		// already been proven on the first transaction in the block is
 		// a coinbase.
 		if txIdx != 0 {
-			for range tx.MsgTx().TxIn {
-				// We'll access the slice of all the
-				// transactions spent in this block properly
-				// ordered to fetch the previous input script.
-				pkScript := stxos[stxoIndex].PkScript
-				idx.indexPkScript(data, pkScript, txIdx)
+			// When the spend journal is unavailable (e.g. pruned for old
+			// blocks during cold compaction), stxos is nil. Input-address
+			// entries cannot be located without the spent output scripts,
+			// so skip input indexing entirely and only index output
+			// addresses. This is safe because a nil stxos slice has no
+			// entries to read; indexing into it would panic and crash the
+			// node. Callers that need input addresses (ConnectBlock,
+			// DisconnectBlock) always pass a complete stxos slice.
+			if stxos != nil {
+				for range tx.MsgTx().TxIn {
+					// We'll access the slice of all the
+					// transactions spent in this block properly
+					// ordered to fetch the previous input script.
+					pkScript := stxos[stxoIndex].PkScript
+					idx.indexPkScript(data, pkScript, txIdx)
 
-				// With an input indexed, we'll advance the
-				// stxo counter.
-				stxoIndex++
+					// With an input indexed, we'll advance the
+					// stxo counter.
+					stxoIndex++
+				}
 			}
 		}
 
@@ -744,6 +826,18 @@ func (idx *AddrIndex) indexBlock(data writeIndexData, block *btcutil.Block,
 			idx.indexPkScript(data, txOut.PkScript, txIdx)
 		}
 	}
+}
+
+// blockHasNonCoinbaseInputs reports whether any non-coinbase transaction in
+// the block spends an input.
+func blockHasNonCoinbaseInputs(block *btcutil.Block) bool {
+	txs := block.Transactions()
+	for i := 1; i < len(txs); i++ {
+		if len(txs[i].MsgTx().TxIn) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnectBlock is invoked by the index manager when a new block has been
@@ -755,8 +849,8 @@ func (idx *AddrIndex) ConnectBlock(dbTx database.Tx, block *btcutil.Block,
 	stxos []blockchain.SpentTxOut) error {
 
 	// The offset and length of the transactions within the serialized
-	// block.
-	txLocs, err := block.TxLoc()
+	// block. Cold blocks use stripped-relative offsets.
+	txLocs, err := blockTxLocs(dbTx, block)
 	if err != nil {
 		return err
 	}
@@ -807,6 +901,96 @@ func (idx *AddrIndex) DisconnectBlock(dbTx database.Tx, block *btcutil.Block,
 		}
 	}
 
+	return nil
+}
+
+// RewriteTxOffsetsForColdCompaction rewrites the address-index entries for every
+// (address, transaction) pair in the block so that the stored byte offsets are
+// relative to the stripped (non-witness) serialization.
+//
+// The address index stores <blockID><txStart><txLen> per (address, tx) entry,
+// where txStart/txLen come from block.TxLoc() on the FULL (hot) block
+// (witness-relative offsets). After compaction the block is stored stripped,
+// so those offsets are wrong for any block containing a segwit transaction —
+// searchrawtransactions would return garbled transaction bytes.
+//
+// The caller MUST pass the full hot block (or an equivalent in-memory block
+// whose TxLoc is still witness-relative). Passing a block parsed from
+// stripped FetchBlock bytes makes oldToNew an identity map and leaves
+// entries stale — that was a production age-out bug.
+//
+// The rewrite re-derives TxLoc from the stripped serialization and, for each
+// address that appears in the block, scans the level data for entries matching
+// the block ID and overwrites the offset/length fields. The block ID, entry
+// count, and level structure are unchanged.
+//
+// If stxos is nil the input-address entries cannot be located (indexBlock needs
+// spent output scripts to extract input addresses). Compaction is skipped at
+// the chain layer when the spend journal is missing; this method also returns
+// an error for nil stxos when the block has non-coinbase inputs so a direct
+// caller cannot leave stale input-address offsets in place.
+//
+// This is part of the OffsetRewriter optional interface.
+func (idx *AddrIndex) RewriteTxOffsetsForColdCompaction(dbTx database.Tx,
+	block *btcutil.Block, stxos []blockchain.SpentTxOut) error {
+
+	if stxos == nil && blockHasNonCoinbaseInputs(block) {
+		return fmt.Errorf("cold compaction addrindex rewrite: spend journal "+
+			"required for block %s (non-coinbase inputs); refusing to leave "+
+			"stale input-address offsets", block.Hash())
+	}
+
+	// Re-serialize the block without witness and compute stripped TxLocs.
+	strippedBytes, err := block.BytesNoWitness()
+	if err != nil {
+		return fmt.Errorf("cold compaction addrindex rewrite: "+
+			"serialize stripped block %s: %v", block.Hash(), err)
+	}
+	strippedBlock, err := btcutil.NewBlockFromBytes(strippedBytes)
+	if err != nil {
+		return fmt.Errorf("cold compaction addrindex rewrite: "+
+			"parse stripped block %s: %v", block.Hash(), err)
+	}
+	strippedTxLocs, err := strippedBlock.TxLoc()
+	if err != nil {
+		return fmt.Errorf("cold compaction addrindex rewrite: "+
+			"stripped TxLoc for %s: %v", block.Hash(), err)
+	}
+
+	// Also compute the witness-relative TxLocs so we can map old entry offsets
+	// to new ones. Each transaction has a unique TxStart within the block, so
+	// oldTxStart uniquely identifies which transaction an entry refers to.
+	fullTxLocs, err := block.TxLoc()
+	if err != nil {
+		return fmt.Errorf("cold compaction addrindex rewrite: "+
+			"full TxLoc for %s: %v", block.Hash(), err)
+	}
+	oldToNew := make(map[uint32]wire.TxLoc, len(fullTxLocs))
+	for i := range fullTxLocs {
+		oldToNew[uint32(fullTxLocs[i].TxStart)] = strippedTxLocs[i]
+	}
+
+	// The block ID is unchanged by compaction.
+	blockID, err := dbFetchBlockIDByHash(dbTx, block.Hash())
+	if err != nil {
+		return fmt.Errorf("cold compaction addrindex rewrite: "+
+			"fetch block id for %s: %v", block.Hash(), err)
+	}
+
+	// Find every address that appears in the block. indexBlock needs stxos to
+	// extract input addresses; with nil stxos only output addresses are
+	// returned, so input-address entries are left with stale offsets (see the
+	// method comment for why that is acceptable when stxos are unavailable).
+	addrsToTxns := make(writeIndexData)
+	idx.indexBlock(addrsToTxns, block, stxos)
+
+	bucket := dbTx.Metadata().Bucket(addrIndexKey)
+	for addrKey := range addrsToTxns {
+		if err := dbUpdateAddrIndexOffsetsForBlock(bucket, addrKey, blockID,
+			block.Hash(), oldToNew); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

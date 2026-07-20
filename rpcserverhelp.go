@@ -21,7 +21,7 @@ var helpDescsEnUS = map[string]string{
 		"The levelspec can either a debug level or of the form:\n" +
 		"<subsystem>=<level>,<subsystem2>=<level2>,...\n" +
 		"The valid debug levels are trace, debug, info, warn, error, and critical.\n" +
-		"The valid subsystems are AMGR, ADXR, BCDB, BMGR, BTCD, CHAN, DISC, PEER, RPCS, SCRP, SRVR, and TXMP.\n" +
+		"The valid subsystems are AMGR, ADXR, BCDB, BMGR, PRXD, CHAN, DISC, PEER, RPCS, SCRP, SRVR, and TXMP.\n" +
 		"Finally the keyword 'show' will return a list of the available subsystems.",
 	"debuglevel-levelspec":   "The debug level(s) to use or the keyword 'show'",
 	"debuglevel--condition0": "levelspec!=show",
@@ -222,7 +222,8 @@ var helpDescsEnUS = map[string]string{
 	"txrawresult-size":          "The size of the transaction in bytes",
 	"txrawresult-vsize":         "The virtual size of the transaction in bytes",
 	"txrawresult-weight":        "The transaction's weight (between vsize*4-3 and vsize*4)",
-	"txrawresult-hash":          "The wtxid of the transaction",
+	"txrawresult-hash":            "The wtxid of the transaction",
+	"txrawresult-witness_excised": "True when the tx was loaded from a cold-tier block with witness excised",
 
 	// SearchRawTransactionsResult help.
 	"searchrawtransactionsresult-hex":           "Hex-encoded transaction",
@@ -238,7 +239,8 @@ var helpDescsEnUS = map[string]string{
 	"searchrawtransactionsresult-blocktime":     "Block time in seconds since the 1 Jan 1970 GMT",
 	"searchrawtransactionsresult-size":          "The size of the transaction in bytes",
 	"searchrawtransactionsresult-vsize":         "The virtual size of the transaction in bytes",
-	"searchrawtransactionsresult-weight":        "The transaction's weight (between vsize*4-3 and vsize*4)",
+	"searchrawtransactionsresult-weight":          "The transaction's weight (between vsize*4-3 and vsize*4)",
+	"searchrawtransactionsresult-witness_excised": "True when the tx was loaded from a cold-tier block with witness excised",
 
 	// GetBlockVerboseResult help.
 	"getblockverboseresult-hash":              "The hash of the block (same as provided)",
@@ -258,6 +260,7 @@ var helpDescsEnUS = map[string]string{
 	"getblockverboseresult-nextblockhash":     "The hash of the next block (only if there is one)",
 	"getblockverboseresult-strippedsize":      "The size of the block without witness data",
 	"getblockverboseresult-weight":            "The weight of the block",
+	"getblockverboseresult-witness_excised":   "True when the block was loaded from the cold tier with witness excised",
 
 	// GetBlockCountCmd help.
 	"getblockcount--synopsis": "Returns the number of blocks in the longest block chain.",
@@ -598,8 +601,8 @@ var helpDescsEnUS = map[string]string{
 	"signmessagewithprivkey--result0":  "The signature of the message encoded in base 64",
 
 	// StopCmd help.
-	"stop--synopsis": "Shutdown btcd.",
-	"stop--result0":  "The string 'btcd stopping.'",
+	"stop--synopsis": "Shutdown praxisd.",
+	"stop--result0":  "The string 'praxisd stopping.'",
 
 	// SubmitBlockOptions help.
 	"submitblockoptions-workid": "This parameter is currently ignored",

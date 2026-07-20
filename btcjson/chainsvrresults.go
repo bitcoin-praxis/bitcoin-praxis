@@ -90,6 +90,9 @@ type GetBlockVerboseResult struct {
 	Difficulty    float64       `json:"difficulty"`
 	PreviousHash  string        `json:"previousblockhash"`
 	NextHash      string        `json:"nextblockhash,omitempty"`
+	// WitnessExcised is true when the block was loaded from the cold tier
+	// (witness stripped). Size and Weight then describe the stripped block.
+	WitnessExcised bool `json:"witness_excised,omitempty"`
 }
 
 // GetBlockVerboseTxResult models the data from the getblock command when the
@@ -116,6 +119,7 @@ type GetBlockVerboseTxResult struct {
 	Difficulty    float64       `json:"difficulty"`
 	PreviousHash  string        `json:"previousblockhash"`
 	NextHash      string        `json:"nextblockhash,omitempty"`
+	WitnessExcised bool          `json:"witness_excised,omitempty"`
 }
 
 // GetChainTipsResult models the data from the getchaintips command.
@@ -784,6 +788,11 @@ type TxRawResult struct {
 	Confirmations uint64 `json:"confirmations,omitempty"`
 	Time          int64  `json:"time,omitempty"`
 	Blocktime     int64  `json:"blocktime,omitempty"`
+	// WitnessExcised is true when the transaction was loaded from a cold-tier
+	// block whose witness data has been stripped. In that case Hash equals
+	// Txid (the historical wtxid is unavailable), Size/Vsize/Weight describe
+	// the stripped serialization only, and txinwitness fields are omitted.
+	WitnessExcised bool `json:"witness_excised,omitempty"`
 }
 
 // SearchRawTransactionsResult models the data from the searchrawtransaction
@@ -803,6 +812,7 @@ type SearchRawTransactionsResult struct {
 	Confirmations uint64       `json:"confirmations,omitempty"`
 	Time          int64        `json:"time,omitempty"`
 	Blocktime     int64        `json:"blocktime,omitempty"`
+	WitnessExcised bool         `json:"witness_excised,omitempty"`
 }
 
 // TxRawDecodeResult models the data from the decoderawtransaction command.

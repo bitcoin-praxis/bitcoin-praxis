@@ -119,6 +119,11 @@ type BlockChain struct {
 	// is pruned.
 	pruneTarget uint64
 
+	// witnessBuffer is the number of recent blocks kept in the hot tier before
+	// age-out compaction to the cold tier. 0 = disabled (full archival). Set
+	// from Config.WitnessBuffer.
+	witnessBuffer int32
+
 	// These fields are related to the memory block index.  They both have
 	// their own locks, however they are often also protected by the chain
 	// lock to help prevent logic races when blocks are being processed.
@@ -686,6 +691,134 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 			}
 		}
 
+		// Age-out compaction: if the witness buffer is configured, compact
+		// the block that just fell out of the hot window to the cold tier.
+		// The block at height (node.height - witnessBuffer) is still in the
+		// best chain (the new tip hasn't been set yet, so the current tip is
+		// at node.height-1, putting the target at witnessBuffer-1 blocks
+		// back). CompactBlockToCold is idempotent: it returns nil if the
+		// block is already cold (e.g. after a reorg that reconnected it).
+		if b.witnessBuffer > 0 && node.height > b.witnessBuffer {
+			ageOutHeight := node.height - b.witnessBuffer
+			ageOutNode := b.bestChain.NodeByHeight(ageOutHeight)
+			if ageOutNode != nil {
+				if cc, ok := dbTx.(database.ColdCompactor); ok {
+					// Fetch spend journal first. When it is missing, skip
+					// compaction entirely: the address index cannot safely
+					// rewrite input-address offsets without stxos, and
+					// leaving the block hot is better than serving garbage
+					// from searchrawtransactions.
+					ageOutBlockBytes, err := dbTx.FetchBlock(&ageOutNode.hash)
+					if err != nil {
+						return fmt.Errorf("age-out: fetch block %s: %v",
+							ageOutNode.hash, err)
+					}
+					ageOutBlock, err := btcutil.NewBlockFromBytes(ageOutBlockBytes)
+					if err != nil {
+						return fmt.Errorf("age-out: parse block %s: %v",
+							ageOutNode.hash, err)
+					}
+					ageOutStxos, stxoErr := dbFetchSpendJournalEntry(dbTx, ageOutBlock)
+					if stxoErr != nil {
+						log.Debugf("Skipping age-out of block %s (height %d): "+
+							"spend journal unavailable (%v); refusing to "+
+							"compact without safe addrindex rewrite",
+							ageOutNode.hash, ageOutHeight, stxoErr)
+					} else {
+						// Snapshot tier before CompactBlockToCold: after a
+						// successful schedule IsColdBlock is also true
+						// (pending counts as cold), so we must know whether
+						// cancel can actually leave the block hot.
+						alreadyCold, err := cc.IsColdBlock(&ageOutNode.hash)
+						if err != nil {
+							return fmt.Errorf("age-out: IsColdBlock %s: %v",
+								ageOutNode.hash, err)
+						}
+						err = cc.CompactBlockToCold(&ageOutNode.hash)
+						if err != nil {
+							log.Debugf("Age-out compaction of "+
+								"block %s (height %d) failed: %v",
+								ageOutNode.hash, ageOutHeight, err)
+						} else if b.indexManager != nil {
+							// Rewrite offset-bearing indexes using the FULL
+							// hot block fetched above. Do NOT re-fetch after
+							// CompactBlockToCold: pending cold makes
+							// FetchBlock return stripped bytes, and
+							// AddrIndex.RewriteTxOffsetsForColdCompaction
+							// needs witness-relative TxLoc keys to find the
+							// stored entries (searchrawtransactions /
+							// wallet rescan path).
+							//
+							// CancelPendingColdCompaction only undoes a
+							// pending hot→cold write. If the block was
+							// already cold (CompactBlockToCold no-op after a
+							// reorg reconnect), a rewrite failure cannot be
+							// rolled back that way — the block stays cold.
+							// That path needs a >witnessBuffer reorg plus a
+							// db failure at the same moment (operator
+							// reconsider of cold tips is refused); ConnectBlock
+							// for already-cold blocks also writes stripped
+							// TxLocs up front. Asymmetry is intentional.
+							//
+							// A rewrite failure on the hot→cold path cancels
+							// the pending cold write and leaves the block hot
+							// permanently for that height (the rolling age-out
+							// advances; it does not retry). Safe: correct
+							// indexes, small disk-savings miss.
+							if cm, ok := b.indexManager.(ColdCompactionIndexManager); ok {
+								if err := cm.RewriteTxOffsetsForColdCompaction(
+									dbTx, ageOutBlock, ageOutStxos); err != nil {
+									if alreadyCold {
+										// Nothing pending to cancel; block
+										// remains cold. Do not claim "left hot".
+										log.Warnf("Age-out index rewrite for "+
+											"already-cold block %s (height %d) "+
+											"failed (%v); block remains cold "+
+											"(cancel pending is a no-op)",
+											ageOutNode.hash, ageOutHeight, err)
+									} else {
+										// Drop the pending cold write so commit
+										// leaves the block hot with intact
+										// witness-relative indexes. Do not fail
+										// tip connect over optional index health.
+										if cerr := cc.CancelPendingColdCompaction(
+											&ageOutNode.hash); cerr != nil {
+											return fmt.Errorf("cold compaction "+
+												"index rewrite for block %s: %v "+
+												"(also cancel pending: %v)",
+												ageOutNode.hash, err, cerr)
+										}
+										log.Warnf("Skipping age-out of block %s "+
+											"(height %d): index rewrite failed "+
+											"(%v); left hot",
+											ageOutNode.hash, ageOutHeight, err)
+									}
+								}
+							}
+						}
+
+						// Reclaim hot-tier files once per difficulty period.
+						if node.height%b.blocksPerRetarget == 0 {
+							if reclaimed, err := cc.ReclaimHotSpace(); err != nil {
+								log.Debugf("Hot-tier reclaim failed: %v", err)
+							} else if reclaimed > 0 {
+								log.Debugf("Reclaimed %d bytes of hot-tier "+
+									"space", reclaimed)
+							}
+						}
+					}
+				}
+			}
+
+			// Drop bodies of stale side-chain forks past the witness
+			// buffer. Headers stay in the block index; bodies are gone
+			// (same spirit as prune). Side chains never received
+			// txindex/spend-journal entries, so no DisconnectBlock.
+			if err := b.dropStaleSideChainBodies(dbTx, ageOutHeight); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -718,6 +851,33 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 	return b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
 	})
+}
+
+// dropStaleSideChainBodies deletes block bodies for non-best-chain forks at or
+// below dropHeight. Headers remain in the block index (HaveData cleared) so
+// ChainTips / fork awareness survive; FetchBlock fails until the block is
+// re-downloaded. Must run inside a writable database transaction.
+func (b *BlockChain) dropStaleSideChainBodies(dbTx database.Tx, dropHeight int32) error {
+	for _, tip := range b.index.InactiveTips(b.bestChain) {
+		for n := tip; n != nil && !b.bestChain.Contains(n); n = n.parent {
+			if n.height > dropHeight || !n.status.HaveData() {
+				continue
+			}
+			if err := dbTx.DeleteBlock(&n.hash); err != nil {
+				return fmt.Errorf("drop stale side-chain body %s (height %d): %w",
+					n.hash, n.height, err)
+			}
+			b.index.UnsetStatusFlags(n, statusDataStored)
+			// Persist header-only status: flushToDB skips !HaveData nodes.
+			if err := dbStoreBlockNode(dbTx, n); err != nil {
+				return fmt.Errorf("persist header-only status for %s: %w",
+					n.hash, err)
+			}
+			log.Debugf("Dropped stale side-chain body %s (height %d)",
+				n.hash, n.height)
+		}
+	}
+	return nil
 }
 
 // disconnectBlock handles disconnecting the passed node/block from the end of
@@ -1893,6 +2053,12 @@ func (b *BlockChain) LocateHeaders(locator BlockLocator, hashStop *chainhash.Has
 // in the best chain is invalidated, the active chain tip will be the parent of the
 // invalidated block.
 //
+// When witness-buffer compaction is enabled, invalidating a block at or below
+// tip−witnessBuffer is refused: the resulting tip would be cold (witness
+// stripped), so tip size/weight and any later reconsider path would be wrong or
+// fail. Deep invalidates are rare; operators who need them should run with
+// --witness-buffer=0 (full archival).
+//
 // This function is safe for concurrent access.
 func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 	b.chainLock.Lock()
@@ -1913,6 +2079,21 @@ func (b *BlockChain) InvalidateBlock(hash *chainhash.Hash) error {
 	// Nothing to do if the given block is already invalid.
 	if node.status.KnownInvalid() {
 		return nil
+	}
+
+	// Refuse invalidates that would leave a cold tip when witness buffering
+	// is active. Parent of the invalidated best-chain block becomes tip.
+	if b.witnessBuffer > 0 && b.bestChain.Contains(node) {
+		newTipHeight := node.height - 1
+		tipHeight := b.bestChain.Tip().height
+		if tipHeight-newTipHeight >= b.witnessBuffer {
+			str := fmt.Sprintf("cannot invalidate block %s at height %d: "+
+				"resulting tip height %d is outside the witness buffer "+
+				"(%d); cold tip lacks retained witness data. Use "+
+				"--witness-buffer=0 for archival invalidate/reconsider",
+				hash, node.height, newTipHeight, b.witnessBuffer)
+			return ruleError(ErrWitnessExcised, str)
+		}
 	}
 
 	// Set the status of the block being invalidated.
@@ -2049,22 +2230,34 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 		return nil
 	}
 
-	// Clear the status of the block being reconsidered.
-	b.index.UnsetStatusFlags(reconsiderNode, statusInvalidAncestor)
-	b.index.UnsetStatusFlags(reconsiderNode, statusValidateFailed)
-
 	// Grab all the tips.
 	tips := b.index.InactiveTips(b.bestChain)
 	tips = append(tips, b.bestChain.Tip())
 
 	log.Debugf("Examining %v inactive chain tips for reconsideration")
 
-	// Go through all the tips and unset the status for all the descendents of the
-	// block being reconsidered.
+	// Find the tip of the branch being reconsidered and snapshot invalid
+	// flags before clearing them. getReorganizeNodes skips KnownInvalid
+	// nodes, so status must be cleared to build the attach list — but a
+	// subsequent cold-attach refusal must restore KnownInvalid so a refused
+	// reconsider does not look like a successful status reset.
+	type invalidSnap struct {
+		node  *blockNode
+		flags blockStatus
+	}
+	var snaps []invalidSnap
+	saveInvalid := func(n *blockNode) {
+		flags := n.status & (statusInvalidAncestor | statusValidateFailed)
+		if flags != 0 {
+			snaps = append(snaps, invalidSnap{node: n, flags: flags})
+		}
+	}
+
 	var reconsiderTip *blockNode
+	saveInvalid(reconsiderNode)
 	for _, tip := range tips {
 		// Continue if the given inactive tip is not a descendant of the block
-		// being invalidated.
+		// being reconsidered.
 		if !tip.IsAncestor(reconsiderNode) {
 			// Set as the reconsider tip if the block node being reconsidered
 			// is a tip.
@@ -2077,8 +2270,30 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 		// Mark the current tip as the tip being reconsidered.
 		reconsiderTip = tip
 
-		// Unset the status of all the parents up until it reaches the block
+		// Snapshot invalid-ancestor flags on the path down to the block
 		// being reconsidered.
+		for n := tip; n != nil && n != reconsiderNode; n = n.parent {
+			saveInvalid(n)
+		}
+	}
+	if reconsiderTip == nil {
+		return fmt.Errorf("requested block hash of %s has no tip to reconsider",
+			hash)
+	}
+
+	restoreInvalid := func() {
+		for _, s := range snaps {
+			b.index.SetStatusFlags(s.node, s.flags)
+		}
+	}
+
+	// Clear the status of the block being reconsidered and its descendants.
+	b.index.UnsetStatusFlags(reconsiderNode, statusInvalidAncestor)
+	b.index.UnsetStatusFlags(reconsiderNode, statusValidateFailed)
+	for _, tip := range tips {
+		if !tip.IsAncestor(reconsiderNode) {
+			continue
+		}
 		for n := tip; n != nil && n != reconsiderNode; n = n.parent {
 			b.index.UnsetStatusFlags(n, statusInvalidAncestor)
 		}
@@ -2095,6 +2310,14 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 	// If the reconsider tip has a higher cumulative work, then reorganize
 	// to it after checking the validity of the nodes.
 	detachNodes, attachNodes := b.getReorganizeNodes(reconsiderTip)
+
+	// Cold (witness-stripped) blocks cannot be re-validated: the commitment
+	// check would fail with a misleading ErrInvalidWitnessCommitment. Refuse
+	// with ErrWitnessExcised and restore the prior invalid status.
+	if err := b.rejectColdAttachNodes(attachNodes); err != nil {
+		restoreInvalid()
+		return err
+	}
 
 	// We're checking if the reorganization that'll happen is actually valid.
 	// While this is called in reorganizeChain, we call it beforehand as the error
@@ -2115,6 +2338,46 @@ func (b *BlockChain) ReconsiderBlock(hash *chainhash.Hash) error {
 	}
 
 	return b.reorganizeChain(detachNodes, attachNodes)
+}
+
+// rejectColdAttachNodes returns ErrWitnessExcised if any block on the attach
+// path is stored in the cold tier. Reconsider/re-validation needs witness.
+func (b *BlockChain) rejectColdAttachNodes(attachNodes *list.List) error {
+	if attachNodes == nil || attachNodes.Len() == 0 {
+		return nil
+	}
+	var coldHash chainhash.Hash
+	var foundCold bool
+	err := b.db.View(func(dbTx database.Tx) error {
+		cc, ok := dbTx.(database.ColdCompactor)
+		if !ok {
+			return nil
+		}
+		for e := attachNodes.Front(); e != nil; e = e.Next() {
+			n := e.Value.(*blockNode)
+			cold, err := cc.IsColdBlock(&n.hash)
+			if err != nil {
+				return err
+			}
+			if cold {
+				coldHash = n.hash
+				foundCold = true
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if foundCold {
+		str := fmt.Sprintf("cannot reconsider block %s: witness data has "+
+			"been pruned by cold-tier compaction; re-validation requires "+
+			"a full archival node (--witness-buffer=0) or a re-download "+
+			"of the block with witness", coldHash)
+		return ruleError(ErrWitnessExcised, str)
+	}
+	return nil
 }
 
 // IndexManager provides a generic interface that the is called when blocks are
@@ -2139,6 +2402,33 @@ type IndexManager interface {
 	// this block is also returned so indexers can clean up the prior index
 	// state for this block.
 	DisconnectBlock(database.Tx, *btcutil.Block, []SpentTxOut) error
+}
+
+// ColdCompactionIndexManager is an optional interface implemented by index
+// managers that maintain index entries carrying block-relative byte offsets
+// (e.g. the transaction index and the address index). When a block is
+// compacted from the hot tier (stored with witness) to the cold tier (stored
+// stripped), the byte offsets of transactions within the block change because
+// witness bytes are removed. Index entries that still reference the old
+// (witness-relative) offsets would cause FetchBlockRegion to read wrong bytes
+// from the cold (stripped) block, corrupting getrawtransaction and
+// searchrawtransactions RPC results and breaking wallet rescans.
+//
+// RewriteTxOffsetsForColdCompaction is called in the same database transaction
+// as CompactBlockToCold, after the compaction has been scheduled. It rewrites
+// the offset-bearing index entries for the block to be relative to the stripped
+// serialization. The block is still readable as its full (hot) serialization
+// during this transaction, so the stripped offsets can be computed. The rewrite
+// and the compaction commit atomically: a rolled-back transaction leaves both
+// the block index and the offset index unchanged.
+//
+// The stxos parameter is the spent transaction outputs for the block (from the
+// spend journal); indexers that need to locate entries by input address (e.g.
+// the address index) require it. The chain layer skips age-out compaction when
+// the spend journal entry is unavailable rather than passing nil.
+type ColdCompactionIndexManager interface {
+	RewriteTxOffsetsForColdCompaction(dbTx database.Tx, block *btcutil.Block,
+		stxos []SpentTxOut) error
 }
 
 // Config is a descriptor which specifies the blockchain instance configuration.
@@ -2213,6 +2503,16 @@ type Config struct {
 	// will target for with block files.  Prune at 0 specifies that no
 	// blocks will be deleted.
 	Prune uint64
+
+	// WitnessBuffer is the number of most recent blocks to keep in the hot
+	// tier (full, uncompressed, with witness) before age-out compaction
+	// moves them to the cold tier (witness-stripped, zstd-compressed).
+	// A value of 0 disables cold-tier compaction entirely (full archival
+	// node, same as upstream btcd). The default is 2016 (roughly two weeks
+	// of blocks), which covers common reorg assumptions and typical LN
+	// delays; use a larger buffer or --witness-buffer=0 if you require
+	// longer witness retention. See docs/ROADMAP.md, M1.
+	WitnessBuffer int32
 }
 
 // New returns a BlockChain instance using the provided configuration details.
@@ -2271,6 +2571,7 @@ func New(config *Config) (*BlockChain, error) {
 		warningCaches:       newThresholdCaches(vbNumBits),
 		deploymentCaches:    newThresholdCaches(chaincfg.DefinedDeployments),
 		pruneTarget:         config.Prune,
+		witnessBuffer:       config.WitnessBuffer,
 	}
 
 	// Ensure all the deployments are synchronized with our clock if

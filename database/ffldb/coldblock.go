@@ -238,6 +238,7 @@ func (cs *coldStore) openWriteFile(fileNum uint32) (filer, uint32, error) {
 		return nil, 0, makeDbErr(database.ErrDriverSpecific,
 			fmt.Sprintf("failed to open cold file %q: %v", filePath, err), err)
 	}
+	adviseSequential(file)
 
 	st, err := file.Stat()
 	if err != nil {

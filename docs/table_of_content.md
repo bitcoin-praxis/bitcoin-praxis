@@ -9,6 +9,7 @@
 * [Wallet](wallet.md)
 * [Roadmap](ROADMAP.md)
 * [M1 test plan](M1_TEST_PLAN.md)
+* [M2 test plan](M2_TEST_PLAN.md)
 * [Developer resources](developer_resources.md)
 * [JSON RPC API](json_rpc_api.md)
 * [Code contribution guidelines](code_contribution_guidelines.md)

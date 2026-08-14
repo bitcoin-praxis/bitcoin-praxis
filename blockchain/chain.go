@@ -693,130 +693,8 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 		// Age-out compaction: if the witness buffer is configured, compact
 		// the block that just fell out of the hot window to the cold tier.
-		// The block at height (node.height - witnessBuffer) is still in the
-		// best chain (the new tip hasn't been set yet, so the current tip is
-		// at node.height-1, putting the target at witnessBuffer-1 blocks
-		// back). CompactBlockToCold is idempotent: it returns nil if the
-		// block is already cold (e.g. after a reorg that reconnected it).
-		if b.witnessBuffer > 0 && node.height > b.witnessBuffer {
-			ageOutHeight := node.height - b.witnessBuffer
-			ageOutNode := b.bestChain.NodeByHeight(ageOutHeight)
-			if ageOutNode != nil {
-				if cc, ok := dbTx.(database.ColdCompactor); ok {
-					// Fetch spend journal first. When it is missing, skip
-					// compaction entirely: the address index cannot safely
-					// rewrite input-address offsets without stxos, and
-					// leaving the block hot is better than serving garbage
-					// from searchrawtransactions.
-					ageOutBlockBytes, err := dbTx.FetchBlock(&ageOutNode.hash)
-					if err != nil {
-						return fmt.Errorf("age-out: fetch block %s: %v",
-							ageOutNode.hash, err)
-					}
-					ageOutBlock, err := btcutil.NewBlockFromBytes(ageOutBlockBytes)
-					if err != nil {
-						return fmt.Errorf("age-out: parse block %s: %v",
-							ageOutNode.hash, err)
-					}
-					ageOutStxos, stxoErr := dbFetchSpendJournalEntry(dbTx, ageOutBlock)
-					if stxoErr != nil {
-						log.Debugf("Skipping age-out of block %s (height %d): "+
-							"spend journal unavailable (%v); refusing to "+
-							"compact without safe addrindex rewrite",
-							ageOutNode.hash, ageOutHeight, stxoErr)
-					} else {
-						// Snapshot tier before CompactBlockToCold: after a
-						// successful schedule IsColdBlock is also true
-						// (pending counts as cold), so we must know whether
-						// cancel can actually leave the block hot.
-						alreadyCold, err := cc.IsColdBlock(&ageOutNode.hash)
-						if err != nil {
-							return fmt.Errorf("age-out: IsColdBlock %s: %v",
-								ageOutNode.hash, err)
-						}
-						err = cc.CompactBlockToCold(&ageOutNode.hash)
-						if err != nil {
-							log.Debugf("Age-out compaction of "+
-								"block %s (height %d) failed: %v",
-								ageOutNode.hash, ageOutHeight, err)
-						} else if b.indexManager != nil {
-							// Rewrite offset-bearing indexes using the FULL
-							// hot block fetched above. Do NOT re-fetch after
-							// CompactBlockToCold: pending cold makes
-							// FetchBlock return stripped bytes, and
-							// AddrIndex.RewriteTxOffsetsForColdCompaction
-							// needs witness-relative TxLoc keys to find the
-							// stored entries (searchrawtransactions /
-							// wallet rescan path).
-							//
-							// CancelPendingColdCompaction only undoes a
-							// pending hot→cold write. If the block was
-							// already cold (CompactBlockToCold no-op after a
-							// reorg reconnect), a rewrite failure cannot be
-							// rolled back that way — the block stays cold.
-							// That path needs a >witnessBuffer reorg plus a
-							// db failure at the same moment (operator
-							// reconsider of cold tips is refused); ConnectBlock
-							// for already-cold blocks also writes stripped
-							// TxLocs up front. Asymmetry is intentional.
-							//
-							// A rewrite failure on the hot→cold path cancels
-							// the pending cold write and leaves the block hot
-							// permanently for that height (the rolling age-out
-							// advances; it does not retry). Safe: correct
-							// indexes, small disk-savings miss.
-							if cm, ok := b.indexManager.(ColdCompactionIndexManager); ok {
-								if err := cm.RewriteTxOffsetsForColdCompaction(
-									dbTx, ageOutBlock, ageOutStxos); err != nil {
-									if alreadyCold {
-										// Nothing pending to cancel; block
-										// remains cold. Do not claim "left hot".
-										log.Warnf("Age-out index rewrite for "+
-											"already-cold block %s (height %d) "+
-											"failed (%v); block remains cold "+
-											"(cancel pending is a no-op)",
-											ageOutNode.hash, ageOutHeight, err)
-									} else {
-										// Drop the pending cold write so commit
-										// leaves the block hot with intact
-										// witness-relative indexes. Do not fail
-										// tip connect over optional index health.
-										if cerr := cc.CancelPendingColdCompaction(
-											&ageOutNode.hash); cerr != nil {
-											return fmt.Errorf("cold compaction "+
-												"index rewrite for block %s: %v "+
-												"(also cancel pending: %v)",
-												ageOutNode.hash, err, cerr)
-										}
-										log.Warnf("Skipping age-out of block %s "+
-											"(height %d): index rewrite failed "+
-											"(%v); left hot",
-											ageOutNode.hash, ageOutHeight, err)
-									}
-								}
-							}
-						}
-
-						// Reclaim hot-tier files once per difficulty period.
-						if node.height%b.blocksPerRetarget == 0 {
-							if reclaimed, err := cc.ReclaimHotSpace(); err != nil {
-								log.Debugf("Hot-tier reclaim failed: %v", err)
-							} else if reclaimed > 0 {
-								log.Debugf("Reclaimed %d bytes of hot-tier "+
-									"space", reclaimed)
-							}
-						}
-					}
-				}
-			}
-
-			// Drop bodies of stale side-chain forks past the witness
-			// buffer. Headers stay in the block index; bodies are gone
-			// (same spirit as prune). Side chains never received
-			// txindex/spend-journal entries, so no DisconnectBlock.
-			if err := b.dropStaleSideChainBodies(dbTx, ageOutHeight); err != nil {
-				return err
-			}
+		if err := b.ageOutFallenWindow(dbTx, node); err != nil {
+			return err
 		}
 
 		return nil
@@ -848,9 +726,133 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 
 	// Since we may have changed the UTXO cache, we make sure it didn't exceed its
 	// maximum size.  If we're pruned and have flushed already, this will be a no-op.
-	return b.db.Update(func(dbTx database.Tx) error {
+	err = b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, FlushIfNeeded, state)
 	})
+	if err != nil {
+		return err
+	}
+	b.utxoCache.afterFlushCommit()
+	return nil
+}
+
+// ageOutFallenWindow compacts the block that just left the hot window, then
+// drops stale side-chain bodies at that height. IBD cold-direct writes are
+// already cold: skip fetch/decompress/compact on that path.
+func (b *BlockChain) ageOutFallenWindow(dbTx database.Tx, node *blockNode) error {
+	if b.witnessBuffer <= 0 || node.height <= b.witnessBuffer {
+		return nil
+	}
+	ageOutHeight := node.height - b.witnessBuffer
+	ageOutNode := b.bestChain.NodeByHeight(ageOutHeight)
+	if ageOutNode == nil {
+		return b.maybeDropStaleSideChains(dbTx, node.height, ageOutHeight)
+	}
+	cc, ok := dbTx.(database.ColdCompactor)
+	if !ok {
+		return b.maybeDropStaleSideChains(dbTx, node.height, ageOutHeight)
+	}
+	alreadyCold, err := cc.IsColdBlock(&ageOutNode.hash)
+	if err != nil {
+		return fmt.Errorf("age-out: IsColdBlock %s: %v", ageOutNode.hash, err)
+	}
+	if alreadyCold {
+		b.maybeReclaimHotSpace(cc, node.height)
+		return b.maybeDropStaleSideChains(dbTx, node.height, ageOutHeight)
+	}
+	if err := b.compactHotAgeOut(dbTx, cc, node, ageOutNode, ageOutHeight); err != nil {
+		return err
+	}
+	return b.maybeDropStaleSideChains(dbTx, node.height, ageOutHeight)
+}
+
+func (b *BlockChain) maybeReclaimHotSpace(cc database.ColdCompactor, height int32) {
+	if height%b.blocksPerRetarget != 0 {
+		return
+	}
+	reclaimed, err := cc.ReclaimHotSpace()
+	if err != nil {
+		log.Debugf("Hot-tier reclaim failed: %v", err)
+		return
+	}
+	if reclaimed > 0 {
+		log.Debugf("Reclaimed %d bytes of hot-tier space", reclaimed)
+	}
+}
+
+// maybeDropStaleSideChains deletes fork bodies past the witness buffer.
+// InactiveTips walks the full header index, so this runs once per retarget
+// (~2016 blocks) rather than on every connect — otherwise headers-ahead IBD
+// pays O(header count) per block.
+func (b *BlockChain) maybeDropStaleSideChains(dbTx database.Tx, tipHeight, dropHeight int32) error {
+	if tipHeight%b.blocksPerRetarget != 0 {
+		return nil
+	}
+	return b.dropStaleSideChainBodies(dbTx, dropHeight)
+}
+
+// compactHotAgeOut moves a still-hot block to the cold tier and rewrites
+// offset-bearing indexes from the full hot bytes. Callers must skip this
+// when the block is already cold (IBD StoreBlockCold).
+func (b *BlockChain) compactHotAgeOut(dbTx database.Tx, cc database.ColdCompactor,
+	node *blockNode, ageOutNode *blockNode, ageOutHeight int32) error {
+
+	ageOutBlockBytes, err := dbTx.FetchBlock(&ageOutNode.hash)
+	if err != nil {
+		return fmt.Errorf("age-out: fetch block %s: %v", ageOutNode.hash, err)
+	}
+	ageOutBlock, err := btcutil.NewBlockFromBytes(ageOutBlockBytes)
+	if err != nil {
+		return fmt.Errorf("age-out: parse block %s: %v", ageOutNode.hash, err)
+	}
+	ageOutStxos, stxoErr := dbFetchSpendJournalEntry(dbTx, ageOutBlock)
+	if stxoErr != nil {
+		log.Debugf("Skipping age-out of block %s (height %d): "+
+			"spend journal unavailable (%v); refusing to "+
+			"compact without safe addrindex rewrite",
+			ageOutNode.hash, ageOutHeight, stxoErr)
+		return nil
+	}
+	err = cc.CompactBlockToCold(&ageOutNode.hash)
+	if err != nil {
+		log.Debugf("Age-out compaction of block %s (height %d) failed: %v",
+			ageOutNode.hash, ageOutHeight, err)
+		b.maybeReclaimHotSpace(cc, node.height)
+		return nil
+	}
+	if err := b.rewriteIndexesAfterHotCompact(dbTx, cc, ageOutBlock, ageOutStxos,
+		ageOutNode, ageOutHeight); err != nil {
+		return err
+	}
+	b.maybeReclaimHotSpace(cc, node.height)
+	return nil
+}
+
+func (b *BlockChain) rewriteIndexesAfterHotCompact(dbTx database.Tx,
+	cc database.ColdCompactor, ageOutBlock *btcutil.Block, ageOutStxos []SpentTxOut,
+	ageOutNode *blockNode, ageOutHeight int32) error {
+
+	if b.indexManager == nil {
+		return nil
+	}
+	cm, ok := b.indexManager.(ColdCompactionIndexManager)
+	if !ok {
+		return nil
+	}
+	err := cm.RewriteTxOffsetsForColdCompaction(dbTx, ageOutBlock, ageOutStxos)
+	if err == nil {
+		return nil
+	}
+	// Drop the pending cold write so commit leaves the block hot with
+	// intact witness-relative indexes. Do not fail tip connect over
+	// optional index health.
+	if cerr := cc.CancelPendingColdCompaction(&ageOutNode.hash); cerr != nil {
+		return fmt.Errorf("cold compaction index rewrite for block %s: %v "+
+			"(also cancel pending: %v)", ageOutNode.hash, err, cerr)
+	}
+	log.Warnf("Skipping age-out of block %s (height %d): index rewrite failed "+
+		"(%v); left hot", ageOutNode.hash, ageOutHeight, err)
+	return nil
 }
 
 // dropStaleSideChainBodies deletes block bodies for non-best-chain forks at or
@@ -858,7 +860,13 @@ func (b *BlockChain) connectBlock(node *blockNode, block *btcutil.Block,
 // ChainTips / fork awareness survive; FetchBlock fails until the block is
 // re-downloaded. Must run inside a writable database transaction.
 func (b *BlockChain) dropStaleSideChainBodies(dbTx database.Tx, dropHeight int32) error {
+	connectedHeight := b.bestChain.Height()
 	for _, tip := range b.index.InactiveTips(b.bestChain) {
+		// Headers-ahead of the connected tip are the IBD header chain, not
+		// stale forks. Walking them is O(header count) and deletes nothing.
+		if tip.height > connectedHeight {
+			continue
+		}
 		for n := tip; n != nil && !b.bestChain.Contains(n); n = n.parent {
 			if n.height > dropHeight || !n.status.HaveData() {
 				continue
@@ -1287,7 +1295,7 @@ func (b *BlockChain) verifyReorganizationValidity(detachNodes, attachNodes *list
 		// In the case the block is determined to be invalid due to a
 		// rule violation, mark it as invalid and mark all of its
 		// descendants as having an invalid ancestor.
-		err = b.checkConnectBlock(n, block, view, nil)
+		err = b.checkConnectBlock(n, block, view, nil, BFNone)
 		if err != nil {
 			if _, ok := err.(RuleError); ok {
 				b.index.SetStatusFlags(n, statusValidateFailed)
@@ -1356,7 +1364,7 @@ func (b *BlockChain) connectBestChain(node *blockNode, block *btcutil.Block, fla
 			// expensive memory allocation done by fetch input utxos.
 			view := NewUtxoViewpoint()
 			view.SetBestHash(parentHash)
-			err := b.checkConnectBlock(node, block, view, nil)
+			err := b.checkConnectBlock(node, block, view, nil, flags)
 			if err == nil {
 				b.index.SetStatusFlags(node, statusValid)
 			} else if _, ok := err.(RuleError); ok {

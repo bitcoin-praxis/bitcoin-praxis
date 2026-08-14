@@ -34,10 +34,10 @@ is the deepest and most volatile workstream and goes last.
    separately or dropped beyond a rolling reorg-safe buffer) — never from
    deleting the transaction history itself. A full-archival mode that retains
    witness forever is always available.
-3. **Pure Go, no web, no CGo by default.** The Go language is the on-ramp for new
-   contributors who want to avoid Core's language and in-group gatekeeping. The
-   GUI is non-web (GioUI). CGo is only an optional stretch for hardware-wallet
-   device transport.
+3. **Go first, CGo only where it is the audited fast path.** The GUI is non-web
+   (GioUI). Signature verify uses cgo `libsecp256k1` by default on non-Windows
+   (same library Core uses) with a pure-Go `btcec` fallback (`CGO_ENABLED=0` /
+   Windows). Hardware-wallet transport remains an optional later stretch.
 4. **Linux-first where OS-specific features apply.** io_uring lands on Linux
    first; macOS and Windows I/O work follows.
 
@@ -62,7 +62,7 @@ flowchart TD
 | # | Milestone | Headline Claim |
 |---|---|---|
 | M1 | Witness-Separated Storage | **52.5% smaller** (measured on 1005 GB mainnet chain → ~477 GB), Lightning-compatible |
-| M2 | Parallel Validation Pipeline | 2–3× faster IBD (target) via cross-platform parallel script validation |
+| M2 | Parallel Validation Pipeline | **~1.1–1.2× pipeline + ~4× per-sig (~2.4× validation wall) via libsecp256k1**; live nocheckpoints IBD **nearly 4×** without compression, **~3×** expected with default witness-buffer (2.8× at 732k). Do **not** claim 5×. |
 | M3 | Bundled Wallet + Native GUI | Full Core-QT replacement for non-mining users |
 | M4 | Cross-Platform Async I/O | io_uring on Linux; macOS/Windows I/O backends |
 | M5 | DATUM / Stratum-v2 Mining | First major node with decentralized pool job negotiation |
@@ -351,9 +351,25 @@ This milestone requires no OS-specific code — parallel script validation runs 
 Linux, macOS, and Windows unchanged — so the IBD speedup lands on every platform
 on day one, while the OS-specific async I/O work follows in M4.
 
-**Headline claim:** 2–3× faster initial block download (target) via parallel script
-validation with ordered block connection; cross-platform, no OS-specific
-dependencies.
+**Headline claim:** materially faster full-validation IBD vs stock btcd via
+libsecp256k1 + UTXO miss-path / keep-hot cache + ordered parallel scripts.
+Nocompress public line: **nearly 4× IBD speed increase**. Compression (default
+`--witness-buffer`) is tracking **~3×** (2.8× time-to-height at 732k vs stock
+281.8h; tip wall still running). Do **not** claim 5×.
+
+**Measured (honest, as of 2026-08-14):**
+
+- Parallel validation alone: **~1.1–1.2×** dense mainnet (`cmd/fullvaltip`); the
+  earlier 4.2× was sigcache-warming inflation.
+- Libsecp256k1 (cgo default; pure-Go fallback on Windows/`CGO_ENABLED=0`):
+  **~4× per-sig**, **~2.4×** full validation wall / **~2.8×** DEPTH1; UTXO
+  fingerprint identical across backends. Requires
+  `replace .../txscript/v2 => ./txscript` in root `go.mod`.
+- **Live mainnet IBD** (`--nocheckpoints`, sole LAN Core peer): stock **281.8h**
+  to h960998. Nocompress (libsecp + prefetch + parallel Gets + keep-hot 2 GiB):
+  dense ~570–578k **~3.8×** → **nearly 4×** without compression. Compression B
+  (default `witness-buffer=2016`): **2.8×** time-to-height at 732k, heading to
+  **~3×** at tip. Details in `docs/M2_TEST_PLAN.md`.
 
 ### Scope
 
@@ -387,8 +403,8 @@ dependencies.
 
 | Phase | Scope |
 |---|---|
-| B-1 | Parallel validation pipeline in `netsync`. Benchmark on regtest/mainnet IBD replay. |
-| B-2 | POSIX `fadvise`/`madvise` hints on block files (Linux/macOS/BSDs). |
+| B-1 | Parallel validation + libsecp + UTXO keep-hot. Status: **shipped.** Parallel scripts ~1.1–1.2×; libsecp ~2.4× validation wall; live nocheckpoints IBD **nearly 4×** without compression, **~2.8× at 732k** with compression (heading ~3×). See `docs/M2_TEST_PLAN.md`. |
+| B-2 | POSIX `posix_fadvise(SEQUENTIAL)` on hot/cold open. Status: **done** (Windows no-op). `madvise` deferred (`ReadAt`, not mmap). |
 
 ---
 

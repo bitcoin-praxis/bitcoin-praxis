@@ -1,0 +1,97 @@
+name: Release
+
+# Build and publish per-platform release artifacts when a release is tagged.
+#
+# The cgo libsecp256k1 backend is the default on every non-Windows target and
+# is compiled inline from vendored C (no system libsecp256k1 needed), so each
+# cgo job only needs the platform C toolchain that the runner already has.
+# Windows ships the pure-Go fallback (CGO_ENABLED=0) because libsecp256k1 is
+# fiddly to build there. Every cgo job runs on a runner whose arch matches the
+# target arch, so no cross-C toolchain is required.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: '1.26.3'
+
+jobs:
+  build:
+    name: Build artifact
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, runner: ubuntu-latest,   cgo: '1', archive: tar.gz }
+          - { goos: linux,   goarch: arm64, runner: ubuntu-24.04-arm, cgo: '1', archive: tar.gz }
+          - { goos: darwin,  goarch: amd64, runner: macos-15-intel,   cgo: '1', archive: tar.gz }
+          - { goos: darwin,  goarch: arm64, runner: macos-14,         cgo: '1', archive: tar.gz }
+          - { goos: windows, goarch: amd64, runner: windows-latest,    cgo: '0', archive: zip }
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          TARGET: praxis-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: |
+          mkdir -p "$TARGET"
+          go build -trimpath -ldflags="-s -w -buildid=" -o "$TARGET/praxisd${{ matrix.goos == 'windows' && '.exe' || '' }}" .
+          go build -trimpath -ldflags="-s -w -buildid=" -o "$TARGET/praxctl${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/praxctl
+        shell: bash
+
+      - name: Archive artifact
+        env:
+          TARGET: praxis-${{ matrix.goos }}-${{ matrix.goarch }}
+          ARCHIVE: praxis-${{ github.ref_name }}-${{ matrix.goos }}-${{ matrix.goarch }}
+        run: |
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            # bsdtar (Windows runner) writes zip via format autodetection.
+            tar -caf "$ARCHIVE.zip" "$TARGET"
+            echo "ASSET=$ARCHIVE.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$ARCHIVE.tar.gz" "$TARGET"
+            echo "ASSET=$ARCHIVE.tar.gz" >> "$GITHUB_ENV"
+          fi
+        shell: bash
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: praxis-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: praxis-*-${{ matrix.goos }}-${{ matrix.goarch }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: praxis-*
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/praxis-*
+          generate_release_notes: true

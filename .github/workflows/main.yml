@@ -66,3 +66,49 @@ jobs:
 
       - name: Test
         run: make unit-race
+
+  # The pure-Go fallback path is what ships on Windows and what anyone gets with
+  # CGO_ENABLED=0 (cross-compilation, reproducible builds). It must stay green
+  # because it is the consensus-critical fallback when the cgo libsecp256k1
+  # backend is not selected. This job builds and tests with CGO disabled.
+  unit-purego:
+    name: Unit (pure-Go fallback)
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build (pure-Go)
+        run: make build
+
+      - name: Test (pure-Go)
+        run: make unit
+
+  # Native arm64 cgo job: confirms the libsecp256k1 cgo backend builds and passes
+  # on arm64 (the other non-Windows server target that gets the fast path).
+  unit-arm64-cgo:
+    name: Unit (cgo, arm64)
+    runs-on: ubuntu-24.04-arm
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build (cgo, arm64)
+        run: make build
+
+      - name: Test (cgo, arm64)
+        run: make unit

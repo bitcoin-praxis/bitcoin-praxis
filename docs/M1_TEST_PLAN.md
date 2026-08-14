@@ -138,8 +138,9 @@ This is evidence, not a substitute for the matrix above.
 | Post M1 | Simnet LN cold soak vs excised witness (CSV ≪ `--witness-buffer`): warm/cold pay, coop close, force close, SCB restore | Pass |
 | 2026-07-20 | `TestColdRPCSmoke` (regtest + txindex/addrindex past buffer) | Pass |
 
-**Still planned:** longer mainnet IBD soak; M2 IBD replay benchmark; broader LN
-soak matrix; M3 Bitcoin-Praxis Wallet / GUI acceptance tests (see ROADMAP).
+**Still planned:** finish mainnet nocheckpoints IBD tip wall vs stock (see
+`docs/M2_TEST_PLAN.md`); broader LN soak matrix; M3 Bitcoin-Praxis Wallet / GUI
+acceptance tests (see ROADMAP).
 
 ## What the Tests Prove
 

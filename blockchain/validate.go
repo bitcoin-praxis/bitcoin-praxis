@@ -1131,8 +1131,32 @@ func CheckTransactionInputs(tx *btcutil.Tx, txHeight int32, utxoView *UtxoViewpo
 // connects to the end of the current main chain and then calls this function
 // with that node.
 //
+// BFNoScriptCheck skips the expensive script verification step when scripts
+// were already verified via SoftConnectNext + VerifyBlockScripts.
+//
 // This function MUST be called with the chain state lock held (for writes).
-func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut) error {
+func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut, flags BehaviorFlags) error {
+	scriptFlags, needScripts, err := b.checkConnectBlockNoScripts(node, block, view, stxos)
+	if err != nil {
+		return err
+	}
+	if needScripts && flags&BFNoScriptCheck == 0 {
+		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
+			b.hashCache)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkConnectBlockNoScripts performs checkConnectBlock without running scripts.
+// It returns the script flags that would be used and whether scripts should run
+// (false when before the latest checkpoint). The view is mutated as if the
+// block were connected.
+//
+// This function MUST be called with the chain state lock held (for writes).
+func (b *BlockChain) checkConnectBlockNoScripts(node *blockNode, block *btcutil.Block, view *UtxoViewpoint, stxos *[]SpentTxOut) (txscript.ScriptFlags, bool, error) {
 	// If the side chain blocks end up in the database, a call to
 	// CheckBlockSanity should be done here in case a previous version
 	// allowed a block that is no longer valid.  However, since the
@@ -1143,13 +1167,13 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// an error now.
 	if node.hash.IsEqual(b.chainParams.GenesisHash) {
 		str := "the coinbase for the genesis block is not spendable"
-		return ruleError(ErrMissingTxOut, str)
+		return 0, false, ruleError(ErrMissingTxOut, str)
 	}
 
 	// Ensure the view is for the node being checked.
 	parentHash := &block.MsgBlock().Header.PrevBlock
 	if !view.BestHash().IsEqual(parentHash) {
-		return AssertError(fmt.Sprintf("inconsistent view when "+
+		return 0, false, AssertError(fmt.Sprintf("inconsistent view when "+
 			"checking block connection: best hash is %v instead "+
 			"of expected %v", view.BestHash(), parentHash))
 	}
@@ -1162,7 +1186,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	if bip0030CheckNeeded(node, b.chainParams) {
 		err := b.checkBIP0030(node, block, view)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 	}
 
@@ -1173,7 +1197,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// transaction inputs, counting pay-to-script-hashes, and scripts.
 	err := view.fetchInputUtxos(b.utxoCache, block)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 
 	// BIP0016 describes a pay-to-script-hash type that is considered a
@@ -1187,7 +1211,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// the new rules.
 	segwitState, err := b.deploymentState(node.parent, chaincfg.DeploymentSegwit)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	enforceSegWit := segwitState == ThresholdActive
 
@@ -1209,7 +1233,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		sigOpCost, err := GetSigOpCost(tx, i == 0, view, enforceBIP0016,
 			enforceSegWit)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 
 		// Check for overflow or going over the limits.  We have to do
@@ -1220,7 +1244,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 			str := fmt.Sprintf("block contains too many "+
 				"signature operations - got %v, max %v",
 				totalSigOpCost, MaxBlockSigOpsCost)
-			return ruleError(ErrTooManySigOps, str)
+			return 0, false, ruleError(ErrTooManySigOps, str)
 		}
 	}
 
@@ -1236,7 +1260,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		txFee, err := CheckTransactionInputs(tx, node.height, view,
 			b.chainParams)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 
 		// Sum the total fees and ensure we don't overflow the
@@ -1244,7 +1268,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		lastTotalFees := totalFees
 		totalFees += txFee
 		if totalFees < lastTotalFees {
-			return ruleError(ErrBadFees, "total fees for block "+
+			return 0, false, ruleError(ErrBadFees, "total fees for block "+
 				"overflows accumulator")
 		}
 
@@ -1254,7 +1278,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		// spent txout in the order each transaction spends them.
 		err = view.connectTransaction(tx, node.height, stxos)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 	}
 
@@ -1273,7 +1297,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		str := fmt.Sprintf("coinbase transaction for block pays %v "+
 			"which is more than expected value of %v",
 			totalSatoshiOut, expectedSatoshiOut)
-		return ruleError(ErrBadCoinbaseValue, str)
+		return 0, false, ruleError(ErrBadCoinbaseValue, str)
 	}
 
 	// Don't run scripts if this node is before the latest known good
@@ -1312,7 +1336,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 	// the soft-fork deployment is fully active.
 	csvState, err := b.deploymentState(node.parent, chaincfg.DeploymentCSV)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if csvState == ThresholdActive {
 		// If the CSV soft-fork is now active, then modify the
@@ -1335,14 +1359,14 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 			sequenceLock, err := b.calcSequenceLock(node, tx, view,
 				false)
 			if err != nil {
-				return err
+				return 0, false, err
 			}
 			if !SequenceLockActive(sequenceLock, node.height,
 				medianTime) {
 				str := fmt.Sprintf("block contains " +
 					"transaction whose input sequence " +
 					"locks are not met")
-				return ruleError(ErrUnfinalizedTx, str)
+				return 0, false, ruleError(ErrUnfinalizedTx, str)
 			}
 		}
 	}
@@ -1360,29 +1384,17 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block *btcutil.Block, vi
 		node.parent, chaincfg.DeploymentTaproot,
 	)
 	if err != nil {
-		return err
+		return 0, false, err
 	}
 	if taprootState == ThresholdActive {
 		scriptFlags |= txscript.ScriptVerifyTaproot
-	}
-
-	// Now that the inexpensive checks are done and have passed, verify the
-	// transactions are actually allowed to spend the coins by running the
-	// expensive ECDSA signature check scripts.  Doing this last helps
-	// prevent CPU exhaustion attacks.
-	if runScripts {
-		err := checkBlockScripts(block, view, scriptFlags, b.sigCache,
-			b.hashCache)
-		if err != nil {
-			return err
-		}
 	}
 
 	// Update the best hash for view to include this block since all of its
 	// transactions have been connected.
 	view.SetBestHash(&node.hash)
 
-	return nil
+	return scriptFlags, runScripts, nil
 }
 
 // CheckConnectBlockTemplate fully validates that connecting the passed block to
@@ -1422,7 +1434,7 @@ func (b *BlockChain) CheckConnectBlockTemplate(block *btcutil.Block) error {
 	view := NewUtxoViewpoint()
 	view.SetBestHash(&tip.hash)
 	newNode := newBlockNode(&header, tip)
-	return b.checkConnectBlock(newNode, block, view, nil)
+	return b.checkConnectBlock(newNode, block, view, nil, flags)
 }
 
 // ChainParams returns the Blockchain's configured chaincfg.Params.

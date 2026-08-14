@@ -76,4 +76,19 @@ func TestColdDirectStoreWhenHeadersAhead(t *testing.T) {
 				height, cold, wantCold, headerHeight, buffer)
 		}
 	}
+
+	// Connecting past the buffer must not re-fetch already-cold bodies
+	// (IBD path). Heights 1..14 stay cold; 15..19 stay hot.
+	for height := int32(1); height <= 14; height++ {
+		hash := blocks[height].Hash()
+		var cold bool
+		err := chain.db.View(func(dbTx database.Tx) error {
+			cold, err = dbTx.(database.ColdCompactor).IsColdBlock(hash)
+			return err
+		})
+		if err != nil || !cold {
+			t.Errorf("height %d should remain cold after further connects: cold=%v err=%v",
+				height, cold, err)
+		}
+	}
 }

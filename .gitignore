@@ -58,3 +58,9 @@ coverage.txt.bak
 .aider*
 ln-soak-cold/*
 bin/*
+testdbs/*
+/fullvaltip
+/fullvalprofile
+.perfprobe/
+cmd/backendprobe/
+cmd/mainnetprobe/

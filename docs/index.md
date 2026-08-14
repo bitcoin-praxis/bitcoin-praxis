@@ -8,6 +8,12 @@ mining work live below or beside the consensus layer.
 
 * [Roadmap](ROADMAP.md) — milestones M1–M5
 * [M1 test plan](M1_TEST_PLAN.md) — witness-separated storage matrix and tests we ran
+* [M2 test plan](M2_TEST_PLAN.md) — parallel validation, libsecp, UTXO cache, mainnet IBD
+
+Note: libsecp256k1 (cgo) trades bit-identical reproducible builds for ~2.4×
+validation-wall / ~4× per-sig. Nocheckpoints IBD: **nearly 4×** without
+compression; **~3×** expected with default witness-buffer (2.8× at 732k, tip
+pending). See the M2 test plan. Todo: fixed builder image for reproducible builds.
 
 ## Contents
 

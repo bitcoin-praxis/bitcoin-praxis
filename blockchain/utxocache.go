@@ -7,6 +7,7 @@ package blockchain
 import (
 	"container/list"
 	"fmt"
+	"runtime"
 	"sync"
 	"time"
 
@@ -16,6 +17,25 @@ import (
 	"github.com/btcsuite/btcd/txscript/v2"
 	"github.com/btcsuite/btcd/wire/v2"
 )
+
+// parallelUtxoFetchMin is the miss count at which fetchEntries fans out
+// LevelDB Gets across workers. Below this, a single View is cheaper.
+const parallelUtxoFetchMin = 32
+
+// parallelUtxoFetchWorkers caps concurrent UTXO miss lookups.
+func parallelUtxoFetchWorkers(nMisses int) int {
+	n := runtime.NumCPU()
+	if n > 8 {
+		n = 8
+	}
+	if n > nMisses {
+		n = nMisses
+	}
+	if n < 1 {
+		return 1
+	}
+	return n
+}
 
 // mapSlice is a slice of maps for utxo entries.  The slice of maps are needed to
 // guarantee that the map will only take up N amount of bytes.  As of v1.20, the
@@ -166,6 +186,38 @@ func (ms *mapSlice) makeNewMap(totalEntryMemory uint64) map[wire.OutPoint]*UtxoE
 	return ms.maps[len(ms.maps)-1]
 }
 
+// budgetedMapEntries is the first-map capacity that fits in maxTotalMemoryUsage
+// together with average-size entries. Same formula as newUtxoCache.
+func budgetedMapEntries(maxTotalMemoryUsage uint64) int {
+	n := calculateMinEntries(int(maxTotalMemoryUsage), int(bucketSize)+avgEntrySize)
+	n--
+	if n < 8 {
+		return 8
+	}
+	return n
+}
+
+// compact rebuilds the map slice as a single budgeted map so Go can release
+// extra maps and empty buckets after a keep-hot eviction. Hint is the
+// budgeted cap (same as startup), not 2× remaining entries — that overflowed
+// the cache limit and OOM'd a 15GiB IBD box.
+func (ms *mapSlice) compact() {
+	ms.mtx.Lock()
+	defer ms.mtx.Unlock()
+
+	firstCap := budgetedMapEntries(ms.maxTotalMemoryUsage)
+	fresh := make(map[wire.OutPoint]*UtxoEntry, firstCap)
+	old := ms.maps
+	for i, m := range old {
+		for op, entry := range m {
+			fresh[op] = entry
+		}
+		old[i] = nil
+	}
+	ms.maps = []map[wire.OutPoint]*UtxoEntry{fresh}
+	ms.maxEntries = []int{firstCap}
+}
+
 // deleteMaps deletes all maps except for the first one which should be the biggest.
 //
 // This function is safe for concurrent access.
@@ -184,6 +236,11 @@ const (
 	// block download is complete and it's useful to flush periodically in case
 	// of unforeseen shutdowns.
 	utxoFlushPeriodicInterval = time.Minute * 5
+
+	// utxoCacheKeepFraction is how much of maxTotalMemoryUsage to retain
+	// after a size-triggered flush. Periodic flushes that are under the
+	// cap keep the full working set.
+	utxoCacheKeepFraction = 2
 )
 
 // FlushMode is used to indicate the different urgency types for a flush.
@@ -221,6 +278,12 @@ type utxoCache struct {
 	cachedEntries    mapSlice
 	totalEntryMemory uint64 // Total memory usage in bytes.
 
+	// pendingKeepHotCompact is set when a size-triggered keep-hot flush
+	// evicted in-place and still needs compact() after the DB txn commits.
+	// Compacting inside the txn OOM'd IBD: the 2×-hint map plus the write
+	// batch blew a 15GiB box and rolled the UTXO flush back to genesis.
+	pendingKeepHotCompact bool
+
 	// Below fields are used to indicate when the last flush happened.
 	lastFlushHash chainhash.Hash
 	lastFlushTime time.Time
@@ -229,10 +292,7 @@ type utxoCache struct {
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
 // to the given maximum.
 func newUtxoCache(db database.DB, maxTotalMemoryUsage uint64) *utxoCache {
-	// While the entry isn't included in the map size, add the average size to the
-	// bucket size so we get some leftover space for entries to take up.
-	numMaxElements := calculateMinEntries(int(maxTotalMemoryUsage), bucketSize+avgEntrySize)
-	numMaxElements -= 1
+	numMaxElements := budgetedMapEntries(maxTotalMemoryUsage)
 
 	log.Infof("Pre-allocating for %d MiB", maxTotalMemoryUsage/(1024*1024)+1)
 
@@ -294,22 +354,7 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 		return entries, nil
 	}
 
-	// Fetch the missing outpoints in the cache from the database.
-	dbEntries := make([]*UtxoEntry, len(missingOps))
-	err := s.db.View(func(dbTx database.Tx) error {
-		utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-
-		for i := range missingOps {
-			entry, err := dbFetchUtxoEntry(dbTx, utxoBucket, missingOps[i])
-			if err != nil {
-				return err
-			}
-
-			dbEntries[i] = entry
-		}
-
-		return nil
-	})
+	dbEntries, err := s.fetchMissingFromDB(missingOps)
 	if err != nil {
 		return nil, err
 	}
@@ -331,6 +376,66 @@ func (s *utxoCache) fetchEntries(outpoints []wire.OutPoint) ([]*UtxoEntry, error
 	}
 
 	return entries, nil
+}
+
+// fetchMissingFromDB loads UTXO entries for outpoints that missed the cache.
+// Large miss sets use concurrent LevelDB Views so random Gets overlap instead
+// of running strictly serial (IBD miss path is latency-bound).
+func (s *utxoCache) fetchMissingFromDB(missingOps []wire.OutPoint) ([]*UtxoEntry, error) {
+	dbEntries := make([]*UtxoEntry, len(missingOps))
+	if len(missingOps) < parallelUtxoFetchMin {
+		err := s.db.View(func(dbTx database.Tx) error {
+			return fetchUtxoEntriesInTx(dbTx, missingOps, dbEntries, 0, len(missingOps))
+		})
+		return dbEntries, err
+	}
+
+	workers := parallelUtxoFetchWorkers(len(missingOps))
+	var (
+		wg   sync.WaitGroup
+		once sync.Once
+		ret  error
+	)
+	chunk := (len(missingOps) + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		if start >= len(missingOps) {
+			break
+		}
+		end := start + chunk
+		if end > len(missingOps) {
+			end = len(missingOps)
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			err := s.db.View(func(dbTx database.Tx) error {
+				return fetchUtxoEntriesInTx(dbTx, missingOps, dbEntries, lo, hi)
+			})
+			if err != nil {
+				once.Do(func() { ret = err })
+			}
+		}(start, end)
+	}
+	wg.Wait()
+	return dbEntries, ret
+}
+
+// fetchUtxoEntriesInTx fills dbEntries[lo:hi] from missingOps using an open
+// read transaction. dbEntries slots outside [lo,hi) are left untouched so
+// workers can write disjoint ranges concurrently.
+func fetchUtxoEntriesInTx(dbTx database.Tx, missingOps []wire.OutPoint,
+	dbEntries []*UtxoEntry, lo, hi int) error {
+
+	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+	for i := lo; i < hi; i++ {
+		entry, err := dbFetchUtxoEntry(dbTx, utxoBucket, missingOps[i])
+		if err != nil {
+			return err
+		}
+		dbEntries[i] = entry
+	}
+	return nil
 }
 
 // addTxOut adds the specified output to the cache if it is not provably
@@ -498,50 +603,126 @@ func (s *utxoCache) connectTransactions(block *btcutil.Block, stxos *[]SpentTxOu
 	return nil
 }
 
-// writeCache writes all the entries that are cached in memory to the database atomically.
-func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState) error {
-	// Update commits and flushes the cache to the database.
-	// NOTE: The database has its own cache which gets atomically written
-	// to leveldb.
-	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+// persistCachedEntry writes one cache slot to the UTXO bucket. Nil/spent
+// entries are deleted from disk; unmodified unspent entries are already
+// consistent; modified unspent entries are put.
+func persistCachedEntry(utxoBucket database.Bucket, outpoint wire.OutPoint, entry *UtxoEntry) error {
+	switch {
+	case entry == nil || entry.IsSpent():
+		return dbDeleteUtxoEntry(utxoBucket, outpoint)
+	case !entry.isModified():
+		return nil
+	default:
+		return dbPutUtxoEntry(utxoBucket, outpoint, entry)
+	}
+}
+
+func shouldDropAfterFlush(entry *UtxoEntry, keepHot bool) bool {
+	if !keepHot {
+		return true
+	}
+	return entry == nil || entry.IsSpent()
+}
+
+func (s *utxoCache) persistAllEntries(utxoBucket database.Bucket, keepHot bool) error {
 	for i := range s.cachedEntries.maps {
 		for outpoint, entry := range s.cachedEntries.maps[i] {
-			switch {
-			// If the entry is nil or spent, remove the entry from the database
-			// and the cache.
-			case entry == nil || entry.IsSpent():
-				err := dbDeleteUtxoEntry(utxoBucket, outpoint)
-				if err != nil {
-					return err
-				}
-
-			// No need to update the cache if the entry was not modified.
-			case !entry.isModified():
-			default:
-				// Entry is fresh and needs to be put into the database.
-				err := dbPutUtxoEntry(utxoBucket, outpoint, entry)
-				if err != nil {
-					return err
-				}
+			if err := persistCachedEntry(utxoBucket, outpoint, entry); err != nil {
+				return err
 			}
-
-			delete(s.cachedEntries.maps[i], outpoint)
+			if shouldDropAfterFlush(entry, keepHot) {
+				delete(s.cachedEntries.maps[i], outpoint)
+				continue
+			}
+			if entry.isModified() {
+				entry.markFlushed()
+			}
 		}
 	}
+	return nil
+}
+
+func (s *utxoCache) recountEntryMemory() {
+	var total uint64
+	for _, m := range s.cachedEntries.maps {
+		for _, entry := range m {
+			total += entry.memoryUsage()
+		}
+	}
+	s.totalEntryMemory = total
+}
+
+// evictToKeepHotBudget drops clean entries until they fit both the 50%
+// entry-memory budget and a single budgeted map. Dirty entries are skipped.
+func (s *utxoCache) evictToKeepHotBudget() {
+	keepBudget := s.maxTotalMemoryUsage / utxoCacheKeepFraction
+	maxCount := budgetedMapEntries(s.maxTotalMemoryUsage)
+	count := s.cachedEntries.length()
+	if s.totalEntryMemory <= keepBudget && count <= maxCount {
+		return
+	}
+	for i := range s.cachedEntries.maps {
+		for outpoint, entry := range s.cachedEntries.maps[i] {
+			if s.totalEntryMemory <= keepBudget && count <= maxCount {
+				return
+			}
+			if entry != nil && entry.isModified() {
+				continue
+			}
+			delete(s.cachedEntries.maps[i], outpoint)
+			count--
+			if entry != nil {
+				s.totalEntryMemory -= entry.memoryUsage()
+			}
+		}
+	}
+}
+
+func (s *utxoCache) finishKeepHot(atCap bool) {
+	s.recountEntryMemory()
+	if !atCap {
+		return
+	}
+	s.evictToKeepHotBudget()
+	s.pendingKeepHotCompact = true
+}
+
+func (s *utxoCache) afterFlushCommit() {
+	if !s.pendingKeepHotCompact {
+		return
+	}
+	s.pendingKeepHotCompact = false
+	s.cachedEntries.compact()
+	runtime.GC()
+}
+
+func (s *utxoCache) emptyCache() {
 	s.cachedEntries.deleteMaps()
 	s.totalEntryMemory = 0
+}
 
-	// When done, store the best state hash in the database to indicate the state
-	// is consistent until that hash.
+// writeCache persists dirty UTXO entries. FlushRequired empties the cache.
+// Other modes keep unspent entries as a hot working set and only evict when
+// the cache is at its memory cap.
+func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, keepHot bool) error {
+	atCap := s.totalMemoryUsage() >= s.maxTotalMemoryUsage
+	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
+	if err := s.persistAllEntries(utxoBucket, keepHot); err != nil {
+		return err
+	}
+	if keepHot {
+		s.finishKeepHot(atCap)
+	} else {
+		s.emptyCache()
+	}
+
 	err := dbPutUtxoStateConsistency(dbTx, &bestState.Hash)
 	if err != nil {
 		return err
 	}
 
-	// The best state is the new last flush hash.
 	s.lastFlushHash = bestState.Hash
 	s.lastFlushTime = time.Now()
-
 	return nil
 }
 
@@ -575,10 +756,20 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 	if s.totalMemoryUsage() >= threshold {
 		// Add one to round up the integer division.
 		totalMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
+		keepHot := mode != FlushRequired
 		log.Infof("Flushing UTXO cache of %d MiB with %d entries to disk. For large sizes, "+
 			"this can take up to several minutes...", totalMiB, s.cachedEntries.length())
 
-		return s.writeCache(dbTx, bestState)
+		err := s.writeCache(dbTx, bestState, keepHot)
+		if err != nil {
+			return err
+		}
+		if keepHot {
+			keptMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
+			log.Infof("UTXO cache kept %d MiB with %d entries after flush",
+				keptMiB, s.cachedEntries.length())
+		}
+		return nil
 	}
 
 	return nil
@@ -592,9 +783,36 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 	b.chainLock.Lock()
 	defer b.chainLock.Unlock()
 
-	return b.db.Update(func(dbTx database.Tx) error {
+	err := b.db.Update(func(dbTx database.Tx) error {
 		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
 	})
+	if err != nil {
+		return err
+	}
+	b.utxoCache.afterFlushCommit()
+	return nil
+}
+
+// UtxoCacheFingerprint returns a deterministic hash of the live in-memory UTXO
+// cache contents (unspent entries only). It reuses UtxoViewpoint.Fingerprint so
+// the encoding is identical to the fullvaltip cross-mode gate.
+//
+// This is the fast consensus-gate primitive for tests that compare two chains
+// after processing the same small window: with no cache eviction (small
+// windows on a reasonably sized cache) the in-memory cache holds the full
+// UTXO set, so identical fingerprints imply identical UTXO sets. For windows
+// large enough to trigger eviction, compare a flushed DB instead.
+func (b *BlockChain) UtxoCacheFingerprint() chainhash.Hash {
+	view := NewUtxoViewpoint()
+	for _, m := range b.utxoCache.cachedEntries.maps {
+		for op, entry := range m {
+			if entry == nil || entry.IsSpent() {
+				continue
+			}
+			view.entries[op] = entry
+		}
+	}
+	return view.Fingerprint()
 }
 
 // InitConsistentState checks the consistency status of the utxo state and
@@ -706,6 +924,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 		if err != nil {
 			return err
 		}
+		s.afterFlushCommit()
 
 		if interruptRequested(interrupt) {
 			log.Warn("UTXO state reconstruction interrupted")

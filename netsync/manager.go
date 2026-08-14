@@ -774,10 +774,10 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	// dropped cheaply in QueueBlock before they occupy the blockHandler.
 	sm.markDelivered(*blockHash)
 
-	// During IBD without BFFastAdd, buffer blocks and run ordered parallel
-	// script verification before serial connect. Checkpoint fast-add and
-	// tip-sync keep the historical serial ProcessBlock path.
-	if shouldParallelValidate(sm.ibdMode, behaviorFlags, bmsg.block) {
+	// During IBD without BFFastAdd, enqueue every body so out-of-order
+	// arrivals (light then heavy, or the reverse) still drain. The sig
+	// heuristic only chooses serial vs pipelined verify inside the flush.
+	if shouldEnqueueIBD(sm.ibdMode, behaviorFlags) {
 		sm.enqueueParallelBlock(bmsg, behaviorFlags)
 		sm.flushParallelValidate()
 		return
@@ -884,13 +884,13 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer, maxNew int) *wire.M
 				"existing inventory during header block "+
 				"fetch: %v", err)
 		}
-	if !haveInv {
-		// Every tip-ahead height races across all willing pool peers
-		// (see mayRequestBlock / raceEligibleHeight); late copies are
-		// dropped via isLateRaceBlock.
-		if !sm.mayRequestBlock(peer, *hash, h) {
-			continue
-		}
+		if !haveInv {
+			// Every tip-ahead height races across all willing pool peers
+			// (see mayRequestBlock / raceEligibleHeight); late copies are
+			// dropped via isLateRaceBlock.
+			if !sm.mayRequestBlock(peer, *hash, h) {
+				continue
+			}
 
 			// Cap per-peer in-flight so work stays partitioned
 			// across the parallel IBD pool.

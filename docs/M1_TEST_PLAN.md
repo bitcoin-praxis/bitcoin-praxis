@@ -5,7 +5,7 @@
 The witness-separated storage design (M1) is validated at three levels:
 database-level whitebox tests, blockchain-level integration tests, and
 real-chain measurement tools. Together they cover correctness, consensus safety,
-and the disk-reduction headline.
+and disk reduction.
 
 ## Test Matrix
 

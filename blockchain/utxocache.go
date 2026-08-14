@@ -227,7 +227,9 @@ func (ms *mapSlice) deleteMaps() {
 
 	size := ms.maxEntries[0]
 	ms.maxEntries = []int{size}
-	ms.maps = ms.maps[:1]
+	ms.maps = []map[wire.OutPoint]*UtxoEntry{
+		make(map[wire.OutPoint]*UtxoEntry, size),
+	}
 }
 
 const (
@@ -284,9 +286,21 @@ type utxoCache struct {
 	// batch blew a 15GiB box and rolled the UTXO flush back to genesis.
 	pendingKeepHotCompact bool
 
+	// flushApply holds cache mutations that must wait until db.Update
+	// commits. Applying markFlushed / spent-eviction inside the txn left
+	// memory thinking entries were clean after a rolled-back persist.
+	flushApply pendingFlushApply
+
 	// Below fields are used to indicate when the last flush happened.
 	lastFlushHash chainhash.Hash
 	lastFlushTime time.Time
+}
+
+type pendingFlushApply struct {
+	active  bool
+	keepHot bool
+	atCap   bool
+	hash    chainhash.Hash
 }
 
 // newUtxoCache initiates a new utxo cache instance with its memory usage limited
@@ -624,13 +638,21 @@ func shouldDropAfterFlush(entry *UtxoEntry, keepHot bool) bool {
 	return entry == nil || entry.IsSpent()
 }
 
-func (s *utxoCache) persistAllEntries(utxoBucket database.Bucket, keepHot bool) error {
+func (s *utxoCache) persistAllEntries(utxoBucket database.Bucket) error {
 	for i := range s.cachedEntries.maps {
 		for outpoint, entry := range s.cachedEntries.maps[i] {
 			if err := persistCachedEntry(utxoBucket, outpoint, entry); err != nil {
 				return err
 			}
-			if shouldDropAfterFlush(entry, keepHot) {
+		}
+	}
+	return nil
+}
+
+func (s *utxoCache) applyKeepHotMemory() {
+	for i := range s.cachedEntries.maps {
+		for outpoint, entry := range s.cachedEntries.maps[i] {
+			if shouldDropAfterFlush(entry, true) {
 				delete(s.cachedEntries.maps[i], outpoint)
 				continue
 			}
@@ -639,7 +661,6 @@ func (s *utxoCache) persistAllEntries(utxoBucket database.Bucket, keepHot bool) 
 			}
 		}
 	}
-	return nil
 }
 
 func (s *utxoCache) recountEntryMemory() {
@@ -687,13 +708,38 @@ func (s *utxoCache) finishKeepHot(atCap bool) {
 	s.pendingKeepHotCompact = true
 }
 
+func (s *utxoCache) discardPendingFlush() {
+	s.flushApply = pendingFlushApply{}
+	s.pendingKeepHotCompact = false
+}
+
 func (s *utxoCache) afterFlushCommit() {
+	s.applyFlushMemory()
 	if !s.pendingKeepHotCompact {
 		return
 	}
 	s.pendingKeepHotCompact = false
 	s.cachedEntries.compact()
 	runtime.GC()
+}
+
+func (s *utxoCache) applyFlushMemory() {
+	apply := s.flushApply
+	s.flushApply = pendingFlushApply{}
+	if !apply.active {
+		return
+	}
+	if apply.keepHot {
+		s.applyKeepHotMemory()
+		s.finishKeepHot(apply.atCap)
+		keptMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
+		log.Infof("UTXO cache kept %d MiB with %d entries after flush",
+			keptMiB, s.cachedEntries.length())
+	} else {
+		s.emptyCache()
+	}
+	s.lastFlushHash = apply.hash
+	s.lastFlushTime = time.Now()
 }
 
 func (s *utxoCache) emptyCache() {
@@ -707,22 +753,18 @@ func (s *utxoCache) emptyCache() {
 func (s *utxoCache) writeCache(dbTx database.Tx, bestState *BestState, keepHot bool) error {
 	atCap := s.totalMemoryUsage() >= s.maxTotalMemoryUsage
 	utxoBucket := dbTx.Metadata().Bucket(utxoSetBucketName)
-	if err := s.persistAllEntries(utxoBucket, keepHot); err != nil {
+	if err := s.persistAllEntries(utxoBucket); err != nil {
 		return err
 	}
-	if keepHot {
-		s.finishKeepHot(atCap)
-	} else {
-		s.emptyCache()
-	}
-
-	err := dbPutUtxoStateConsistency(dbTx, &bestState.Hash)
-	if err != nil {
+	if err := dbPutUtxoStateConsistency(dbTx, &bestState.Hash); err != nil {
 		return err
 	}
-
-	s.lastFlushHash = bestState.Hash
-	s.lastFlushTime = time.Now()
+	s.flushApply = pendingFlushApply{
+		active:  true,
+		keepHot: keepHot,
+		atCap:   atCap,
+		hash:    bestState.Hash,
+	}
 	return nil
 }
 
@@ -737,7 +779,8 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 
 	case FlushIfNeeded:
 		// If we performed a flush in the current best state, we have nothing to do.
-		if bestState.Hash == s.lastFlushHash {
+		if bestState.Hash == s.lastFlushHash ||
+			(s.flushApply.active && s.flushApply.hash == bestState.Hash) {
 			return nil
 		}
 
@@ -764,11 +807,6 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 		if err != nil {
 			return err
 		}
-		if keepHot {
-			keptMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
-			log.Infof("UTXO cache kept %d MiB with %d entries after flush",
-				keptMiB, s.cachedEntries.length())
-		}
 		return nil
 	}
 
@@ -787,6 +825,7 @@ func (b *BlockChain) FlushUtxoCache(mode FlushMode) error {
 		return b.utxoCache.flush(dbTx, mode, b.BestSnapshot())
 	})
 	if err != nil {
+		b.utxoCache.discardPendingFlush()
 		return err
 	}
 	b.utxoCache.afterFlushCommit()
@@ -922,6 +961,7 @@ func (b *BlockChain) InitConsistentState(tip *blockNode, interrupt <-chan struct
 			return s.flush(dbTx, FlushIfNeeded, &BestState{Hash: node.hash, Height: node.height})
 		})
 		if err != nil {
+			s.discardPendingFlush()
 			return err
 		}
 		s.afterFlushCommit()

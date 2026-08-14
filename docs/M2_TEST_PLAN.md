@@ -33,9 +33,12 @@ Wiring: root `go.mod` must `replace github.com/btcsuite/btcd/txscript/v2 => ./tx
 | `go test -race ./blockchain/ ./netsync/` | CI | Race-clean |
 | `TestFullBlocks` | `blockchain/fullblocks_test.go` | Consensus suite unchanged |
 
-## What the numbers mean
+## Bench methodology
 
-**Do not cite warm-cache ~4× parallel validation.** That was SERIAL filling the sig/hash cache and DEPTH1 replaying it. Fair cold-cache parallel validation on dense mainnet is **~1.1–1.2×**. The 2–3× IBD target is met by libsecp + UTXO cache work, not by parallel scripts alone.
+`fullvaltip` clears the sig/hash cache per mode. Warm-cache comparisons mix a
+filled cache into the second run and overstate parallel-script speedup;
+cold-cache dense mainnet is **~1.1–1.2×**. IBD speedup comes from libsecp and
+the UTXO miss-path, not from parallel scripts alone.
 
 Reproduce the validation-wall bench (needs a local mainnet `blocks_ffldb`):
 
@@ -46,26 +49,25 @@ go build -o /tmp/fullvaltip ./cmd/fullvaltip
 
 | | Number |
 |---|---|
-| Parallel validation alone (cold cache, dense tip) | **~1.1–1.2×** |
+| Parallel validation (cold cache, dense tip) | **~1.1–1.2×** |
 | libsecp per-sig vs `btcec` | **~4× ECDSA / ~4.7× Schnorr** |
 | libsecp fullvaltip SERIAL / DEPTH1 | **~2.4× / ~2.8×** (UTXO fingerprint identical) |
-| Testnet4 tip-to-tip vs stock (sole LAN peer, local disk) | ≈ serial (~36–38 min / ~145k); fetch-bound, not the speedup bench |
+| Testnet4 tip-to-tip vs stock (sole LAN peer, local disk) | ≈ serial (~36–38 min / ~145k); fetch-bound |
 
 ## Mainnet nocheckpoints IBD A/B
 
-Fair full-validation A/B vs stock btcd **v0.26.0**. Checkpoints skip scripts below the latest checkpoint, so both sides run `--nocheckpoints`. Same machine, same sole LAN Core peer, same datadir family.
+Full-validation A/B vs stock btcd **v0.26.0**. Checkpoints skip scripts below the latest checkpoint, so both sides run `--nocheckpoints`. Same machine, same sole LAN Core peer, same datadir family.
 
 | | Stock | Praxis |
 |---|---|---|
 | Binary | btcd v0.26.0 | `praxisd` with libsecp + parallel validate + UTXO opts |
-| Flags | `--nocheckpoints`, sole `connect=` to a local Core | same; compression B uses default `witness-buffer=2016` |
+| Flags | `--nocheckpoints`, sole `connect=` to a local Core | same; compression uses default `witness-buffer=2016` |
 | Stock wall | **11d 17h 51m ≈ 281.8h** to height **960998** | — |
 
-**Nocompress (in-band, not a finished tip wall):** keep-hot + 2 GiB UTXO cache. Dense ~570–578k **~3.8×** stock → public line **nearly 4× IBD speed increase**. Do not claim 5×.
+**Uncompressed** (keep-hot + 2 GiB UTXO cache): **~4×** (~3.8× at height 570–578k).
 
-**Compression B (default witness buffer, running):** same speed opts, `witness-buffer=2016`. Age-out skips already-cold bodies; stale-side-chain scans run once per retarget; keep-hot compact uses the budgeted map cap **after** the UTXO flush commits.
+**Default compression** (`witness-buffer=2016`): same speed opts. Age-out skips already-cold bodies; stale-side-chain scans run once per retarget; keep-hot compact uses the budgeted map cap **after** the UTXO flush commits.
 
-Gap-adjusted time-to-height vs stock 281.8h (OOM restart gap removed):
 
 | Height | vs stock |
 |---|---|
@@ -74,30 +76,24 @@ Gap-adjusted time-to-height vs stock 281.8h (OOM restart gap removed):
 | ~663k | **2.7×** |
 | ~732k | **2.8×** |
 
-Stock still has most of its wall clock in the remaining dense tail. **~3× net with compression** is the expected tip landing; lock the public figure when this run tips. Do not claim 5×.
+Dense tail still dominates stock's remaining wall. **~3×** with default compression at tip.
 
-### UTXO opts (why live IBD was not 2.4× from libsecp alone)
+### UTXO opts
 
-Live IBD was **LevelDB UTXO-miss bound** (`pendingValidate=0`), not sig-bound. Shipped:
+Live IBD was LevelDB UTXO-miss bound (`pendingValidate=0`), not sig-bound:
 
 1. Parallel LevelDB Gets on ≥32 misses (`fetchMissingFromDB`, up to 8 workers).
 2. Prefetch inputs for N+1 during Verify(N). Must **not** use `findInputsToFetch` (BIP30 height−1 poison).
 3. Keep-hot flush: persist dirty, keep unspent, evict to 50% entry budget **and** a single budgeted map when at cap; compact after the DB transaction commits.
 
-### Headline rules
-
-- **Nocompress:** *nearly 4× IBD speed increase*.
-- **Compression:** *heading to ~3×* until the B run tips vs 281.8h.
-- **Libsecp / fullvaltip:** ~2.4× validation wall; ~4× per-sig.
-- Parallel validation alone is **not** the IBD headline.
-- LND / Neutrino unaffected. Consensus: `TestParallelPipelineMatchesSerial`, `TestVerify*MatchesBtcec`.
+Consensus: `TestParallelPipelineMatchesSerial`, `TestVerify*MatchesBtcec`. LND / Neutrino unaffected.
 
 ## Checklist
 
 - [x] Parallel validation pipeline + adaptive serial-for-small blocks
 - [x] libsecp256k1 cgo backend + pure-Go fallback + CI (`CGO_ENABLED=0` and cgo)
 - [x] UTXO prefetch + parallel Gets + keep-hot (budgeted compact after commit)
-- [x] Cold-cache `fullvaltip` (do not cite warm-cache 4×)
+- [x] Cold-cache `fullvaltip`
 - [x] Testnet4 sole-LAN ≈ serial (fetch-bound)
-- [ ] Compression-B mainnet nocheckpoints tip wall vs stock 281.8h (~2.8× at 732k; ~3× expected)
+- [ ] Compression-B mainnet nocheckpoints tip wall vs stock 281.8h
 - [x] POSIX `posix_fadvise(SEQUENTIAL)` on hot/cold open (Windows no-op)

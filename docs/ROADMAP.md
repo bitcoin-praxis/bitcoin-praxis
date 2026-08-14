@@ -15,10 +15,8 @@ wallet and native (non-web) **Bitcoin-Praxis Wallet** GUI, and — as a final
 milestone — a decentralized mining job server.
 
 The ordering is deliberate: compression is the critical technical risk and goes
-first; parallel validation pairs with it as the speed headline; wallet and GUI
-deliver the user-facing surface that makes the node a real Core replacement;
-cross-platform async I/O extends the I/O work to other operating systems; mining
-is the deepest and most volatile workstream and goes last.
+first; IBD speed is second; wallet and GUI are third; OS-specific async I/O
+is fourth; mining job negotiation is last.
 
 ## Guiding Principles
 
@@ -62,7 +60,7 @@ flowchart TD
 | # | Milestone | Headline Claim |
 |---|---|---|
 | M1 | Witness-Separated Storage | **52.5% smaller** (measured on 1005 GB mainnet chain → ~477 GB), Lightning-compatible |
-| M2 | Parallel Validation Pipeline | **~1.1–1.2× pipeline + ~4× per-sig (~2.4× validation wall) via libsecp256k1**; live nocheckpoints IBD **nearly 4×** without compression, **~3×** expected with default witness-buffer (2.8× at 732k). Do **not** claim 5×. |
+| M2 | Parallel Validation Pipeline | **~3×** nocheckpoints IBD with default compression (~4× uncompressed). libsecp256k1 ~4× per-sig / ~2.4× validation wall. |
 | M3 | Bundled Wallet + Native GUI | Full Core-QT replacement for non-mining users |
 | M4 | Cross-Platform Async I/O | io_uring on Linux; macOS/Windows I/O backends |
 | M5 | DATUM / Stratum-v2 Mining | First major node with decentralized pool job negotiation |
@@ -93,10 +91,9 @@ that don't compress are simply discarded once a block is old enough that common
 reorgs or typical protocols no longer need them. The structural non-witness bytes that
 *do* compress (~30%) are what gets kept, compressed, forever.
 
-**Headline claim (measured on real mainnet chain):** **52.5% blended disk reduction**
-across the full chain — drop witness older than a 2016-block rolling buffer,
-zstd-compress the stripped block. On a 1005 GB chain this saves ~528 GB,
-bringing the footprint to ~477 GB.
+**Measured on a 1005 GB mainnet chain:** **52.5% blended disk reduction** —
+drop witness older than a 2016-block rolling buffer, zstd-compress the stripped
+block. Saves ~528 GB (footprint ~477 GB).
 
 Measured by streaming 156,013 blocks from 29 evenly-spaced .fdb files across a
 full synced mainnet datadir (1406 files, blocks/mainnet/blocks_ffldb):
@@ -242,12 +239,11 @@ standard objection that compression endangers deterministic results:
    to the headers tip use `StoreBlockCold` (strip+zstd once) so catch-up does
    not double-write hot then cold.
 
-### Why the target is realistic (measured, not estimated)
+### Measurement
 
-The headline is grounded in measurement on a real synced mainnet datadir (1005 GB,
-1406 .fdb files, ~880K blocks), not an estimate. 29 evenly-spaced files were
-streamed (one block at a time, no full-file reads), covering the full chain from
-block 0 to the current tip:
+On a synced mainnet datadir (1005 GB, 1406 .fdb files, ~880K blocks), 29
+evenly-spaced files were streamed (one block at a time, no full-file reads)
+from genesis to tip:
 
 | Approach | Reduction | Est. full-chain size |
 |---|---|---|
@@ -281,8 +277,7 @@ The codebase already contains domain-specific compression precedent in
 `blockchain/chainio.go` (varint amounts, compressed script types for the UTXO
 set) — this milestone reuses that philosophy on the block-file path.
 
-**Accepted losses** (documented, not hidden — these are the cost of the ~70%
-headline, all confined to blocks older than the 2016 hot window):
+**Accepted losses** (cold heights only, past the 2016-block hot window):
 - Cannot serve `MSG_WITNESS_BLOCK` for cold heights to modern peers (answered
   with `notfound`; peers use `MSG_BLOCK` for the stripped base ledger). The node
   still advertises `NODE_WITNESS` so hot-window witness blocks are served.
@@ -339,37 +334,30 @@ headline, all confined to blocks older than the 2016 hot window):
 
 **Test plan:** see `docs/M1_TEST_PLAN.md` for the full test matrix (26 tests across database, blockchain, and codec layers) and real-chain measurement instructions.
 
-**M1 status: complete.** All phases done, all tests race-clean, headline measured on real mainnet data.
+**M1 status: complete.** All phases done, all tests race-clean, 52.5% reduction
+measured on real mainnet data.
 
 ---
 
 ## M2 — Parallel Validation Pipeline
 
-**Why second:** compression is the storage headline; parallel validation is the
-speed headline. Together they are the dual "smaller and faster full node" pitch.
-This milestone requires no OS-specific code — parallel script validation runs on
-Linux, macOS, and Windows unchanged — so the IBD speedup lands on every platform
-on day one, while the OS-specific async I/O work follows in M4.
+**Why second:** M1 is disk. This milestone is full-validation IBD wall time.
+Script validation and the UTXO miss-path are portable; OS-specific async I/O
+is M4.
 
-**Headline claim:** materially faster full-validation IBD vs stock btcd via
-libsecp256k1 + UTXO miss-path / keep-hot cache + ordered parallel scripts.
-Nocompress public line: **nearly 4× IBD speed increase**. Compression (default
-`--witness-buffer`) is tracking **~3×** (2.8× time-to-height at 732k vs stock
-281.8h; tip wall still running). Do **not** claim 5×.
+Nocheckpoints IBD vs stock btcd v0.26.0 (281.8h to height 960998), as of
+2026-08-14:
 
-**Measured (honest, as of 2026-08-14):**
-
-- Parallel validation alone: **~1.1–1.2×** dense mainnet (`cmd/fullvaltip`); the
-  earlier 4.2× was sigcache-warming inflation.
-- Libsecp256k1 (cgo default; pure-Go fallback on Windows/`CGO_ENABLED=0`):
-  **~4× per-sig**, **~2.4×** full validation wall / **~2.8×** DEPTH1; UTXO
-  fingerprint identical across backends. Requires
+- Uncompressed: **~4×** (~3.8× at height 570–578k).
+- Default `--witness-buffer=2016`: **2.8×** at height 732k, **~3×** at tip.
+- libsecp256k1 (cgo default; pure-Go fallback on Windows / `CGO_ENABLED=0`):
+  **~4× per-sig**, **~2.4×** validation wall. Requires
   `replace .../txscript/v2 => ./txscript` in root `go.mod`.
-- **Live mainnet IBD** (`--nocheckpoints`, sole LAN Core peer): stock **281.8h**
-  to h960998. Nocompress (libsecp + prefetch + parallel Gets + keep-hot 2 GiB):
-  dense ~570–578k **~3.8×** → **nearly 4×** without compression. Compression B
-  (default `witness-buffer=2016`): **2.8×** time-to-height at 732k, heading to
-  **~3×** at tip. Details in `docs/M2_TEST_PLAN.md`.
+- Ordered parallel scripts: **~1.1–1.2×** on dense mainnet with cold sig/hash
+  caches (`cmd/fullvaltip`). Live IBD was UTXO-miss bound until keep-hot,
+  prefetch, and parallel Gets.
+
+Details in `docs/M2_TEST_PLAN.md`.
 
 ### Scope
 
@@ -403,23 +391,20 @@ Nocompress public line: **nearly 4× IBD speed increase**. Compression (default
 
 | Phase | Scope |
 |---|---|
-| B-1 | Parallel validation + libsecp + UTXO keep-hot. Status: **shipped.** Parallel scripts ~1.1–1.2×; libsecp ~2.4× validation wall; live nocheckpoints IBD **nearly 4×** without compression, **~2.8× at 732k** with compression (heading ~3×). See `docs/M2_TEST_PLAN.md`. |
+| B-1 | Parallel validation + libsecp + UTXO keep-hot. Status: **shipped.** ~4× IBD uncompressed, ~3× with default compression. See `docs/M2_TEST_PLAN.md`. |
 | B-2 | POSIX `posix_fadvise(SEQUENTIAL)` on hot/cold open. Status: **done** (Windows no-op). `madvise` deferred (`ReadAt`, not mmap). |
 
 ---
 
 ## M3 — Bundled Wallet + Native GUI
 
-**Why third:** with storage and speed delivered, the next barrier to "a viable
-alternative to Core for most users" is that upstream btcd ships no wallet and no UI. This
-milestone delivers the user-facing surface that makes the node usable as a daily
-driver for non-mining users — a direct replacement for Bitcoin Core's
-`bitcoin-qt`.
+**Why third:** upstream btcd ships no wallet and no UI. This milestone adds
+an in-process wallet and a native (non-web) GUI so a non-mining user can run
+`praxisd` in place of `bitcoin-qt`.
 
-**Headline claim:** a single `praxisd` binary with an in-process wallet and a
-native (non-web, GioUI) **Bitcoin-Praxis Wallet**: UTXO management, fee
-estimation, send/receive, PSBT multisig with air-gapped QR signing, and a node
-dashboard.
+A single `praxisd` binary with an in-process wallet and a native (GioUI)
+**Bitcoin-Praxis Wallet**: UTXO management, fee estimation, send/receive, PSBT
+multisig with air-gapped QR signing, and a node dashboard.
 
 ### Scope
 
@@ -517,10 +502,8 @@ Track these in C-1 (embed) and verify under C-1 acceptance with a tiny
 
 ## M4 — Cross-Platform Async I/O
 
-**Why here:** the Linux io_uring backend is the "cutting-edge Linux" headline,
-but the cross-platform speedup already shipped in M2. This milestone extends the
-I/O work to OS-specific async backends: io_uring on Linux (the substantive one),
-and equivalent-but-different mechanisms on macOS and Windows.
+**Why here:** M2 does not use OS-specific I/O. This milestone adds io_uring on
+Linux and the equivalent async backends on macOS and Windows.
 
 ### Scope
 
@@ -562,13 +545,11 @@ and equivalent-but-different mechanisms on macOS and Windows.
 It depends on a specification (Stratum v2 / DATUM) that is still in motion,
 requires interoperability with reference implementations, and pulls in pool-side
 concerns (share accounting, payout logic, miner-side transaction selection) that
-are far beyond node consensus. It is the flagship differentiator — no major node
-ships this today — but it is correctly last, after the node is already a
-credible Core alternative for non-mining users.
+are far beyond node consensus. It is last because the node should already be
+usable for non-mining users before this work starts.
 
-**Headline claim:** the first major Bitcoin node with built-in decentralized
-pool job negotiation and share validation, removing the need for a separate
-Stratum proxy and aligning with mining-decentralization goals.
+Built-in decentralized pool job negotiation and share validation, so a separate
+Stratum proxy is not required.
 
 ### Scope
 

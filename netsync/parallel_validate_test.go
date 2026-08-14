@@ -27,7 +27,7 @@ func TestShouldParallelValidate(t *testing.T) {
 		block *btcutil.Block
 		want  bool
 	}{
-		{"ibd light (serial)", true, blockchain.BFNone, light, false},
+		{"ibd light (serial verify)", true, blockchain.BFNone, light, false},
 		{"ibd just-under threshold", true, blockchain.BFNone, under, false},
 		{"ibd at threshold (parallel)", true, blockchain.BFNone, heavy, true},
 		{"ibd fastadd skips", true, blockchain.BFFastAdd, heavy, false},
@@ -36,6 +36,25 @@ func TestShouldParallelValidate(t *testing.T) {
 	}
 	for _, c := range cases {
 		if got := shouldParallelValidate(c.ibd, c.flags, c.block); got != c.want {
+			t.Fatalf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestShouldEnqueueIBD(t *testing.T) {
+	cases := []struct {
+		name  string
+		ibd   bool
+		flags blockchain.BehaviorFlags
+		want  bool
+	}{
+		{"ibd full-validation", true, blockchain.BFNone, true},
+		{"ibd light still enqueued", true, blockchain.BFNone, true},
+		{"ibd fastadd not enqueued", true, blockchain.BFFastAdd, false},
+		{"tip-sync not enqueued", false, blockchain.BFNone, false},
+	}
+	for _, c := range cases {
+		if got := shouldEnqueueIBD(c.ibd, c.flags); got != c.want {
 			t.Fatalf("%s: got %v want %v", c.name, got, c.want)
 		}
 	}

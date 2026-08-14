@@ -482,6 +482,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
+	cache.afterFlushCommit()
 	if cache.cachedEntries.length() != 0 {
 		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
 	}
@@ -545,6 +546,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
+	cache.afterFlushCommit()
 	if cache.cachedEntries.length() != 0 {
 		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
 	}
@@ -598,6 +600,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
+	cache.afterFlushCommit()
 	if cache.cachedEntries.length() != len(outPoints1) {
 		t.Fatalf("Expected %d kept entries after periodic flush, has %d instead",
 			len(outPoints1), cache.cachedEntries.length())
@@ -1044,6 +1047,45 @@ func TestUtxoCacheKeepHotEvictsWhenFull(t *testing.T) {
 	}
 }
 
+func TestKeepHotFlushDefersMemoryUntilCommit(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestKeepHotFlushDefersMemoryUntilCommit")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	op := outpointFromInt(1)
+	txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+	if err := cache.addTxOut(op, &txOut, true, 1); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cache.cachedEntries.get(op)
+	if !ok || entry == nil || !entry.isModified() {
+		t.Fatal("setup: expected dirty cache entry")
+	}
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.writeCache(dbTx, chain.stateSnapshot, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok = cache.cachedEntries.get(op)
+	if !ok || entry == nil {
+		t.Fatal("entry dropped inside the txn before commit apply")
+	}
+	if !entry.isModified() {
+		t.Fatal("dirty bit cleared inside the txn; a rollback would skip replay")
+	}
+
+	cache.afterFlushCommit()
+	entry, ok = cache.cachedEntries.get(op)
+	if !ok || entry == nil {
+		t.Fatal("keep-hot should retain the unspent entry after commit")
+	}
+	if entry.isModified() || entry.isFresh() {
+		t.Fatal("kept entry should be clean after commit apply")
+	}
+}
+
 func TestMapSliceCompactUsesBudgetedCap(t *testing.T) {
 	const maxMem = 64 * 1024
 	wantCap := budgetedMapEntries(maxMem)
@@ -1075,4 +1117,3 @@ func TestMapSliceCompactUsesBudgetedCap(t *testing.T) {
 		t.Fatalf("map size %d exceeds budget %d", ms.size(), maxMem)
 	}
 }
-

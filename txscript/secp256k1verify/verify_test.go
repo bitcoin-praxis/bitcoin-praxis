@@ -63,6 +63,20 @@ func TestVerifyECDSAMatchesBtcec(t *testing.T) {
 				t.Fatalf("ecdsa %s: backend=%v btcec=%v", c.name, got, want)
 			}
 		}
+
+		// High-S is valid ECDSA math; libsecp typically rejects it and the
+		// backend must fall back to btcec so the verdict stays identical.
+		r := sig.R()
+		s := sig.S()
+		if !s.IsOverHalfOrder() {
+			s.Negate()
+		}
+		highSig := ecdsa.NewSignature(&r, &s)
+		gotHigh := VerifyECDSA(highSig, hash, pub)
+		wantHigh := highSig.Verify(hash, pub)
+		if gotHigh != wantHigh {
+			t.Fatalf("ecdsa high-s: backend=%v btcec=%v", gotHigh, wantHigh)
+		}
 	}
 }
 

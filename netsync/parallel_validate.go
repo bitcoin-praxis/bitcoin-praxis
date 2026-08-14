@@ -78,18 +78,20 @@ func scriptWorkersPerBlock(numCPU, batchLen int) int {
 // Empty/sparse blocks (testnet, early mainnet) have 0-few sigs and go serial.
 const parallelValidateMinSigs = 24
 
-// shouldParallelValidate reports whether this IBD block should go through the
-// soft-connect + parallel scripts path. BFFastAdd already skips scripts via
-// checkpoints, so the serial ProcessBlock path is fine there. Light blocks
-// (few signature verifications) also go serial: the pipeline's fixed overhead
-// exceeds its overlap savings on them, which is the source of the light-range
-// regression on testnet / early-mainnet IBD.
+// shouldEnqueueIBD reports whether an IBD body should sit in pendingValidate.
+// Every non-fast-add IBD block is enqueued so a light serial accept cannot
+// strand a heavier block that arrived first. Checkpoints (BFFastAdd) skip
+// scripts and stay on the historical serial path.
+func shouldEnqueueIBD(ibdMode bool, flags blockchain.BehaviorFlags) bool {
+	return ibdMode && flags&blockchain.BFFastAdd == 0
+}
+
+// shouldParallelValidate reports whether an enqueued IBD block should use the
+// soft-connect + pipelined scripts path. Light blocks stay serial: the
+// pipeline's fixed overhead exceeds its overlap savings on them.
 func shouldParallelValidate(ibdMode bool, flags blockchain.BehaviorFlags,
 	block *btcutil.Block) bool {
-	if !ibdMode {
-		return false
-	}
-	if flags&blockchain.BFFastAdd != 0 {
+	if !shouldEnqueueIBD(ibdMode, flags) {
 		return false
 	}
 	return estimateScriptSigs(block) >= parallelValidateMinSigs
@@ -208,24 +210,62 @@ func (sm *SyncManager) findPendingExtending(parent chainhash.Hash) *pendingIBDBl
 	return nil
 }
 
-// flushParallelValidate soft-connects a consecutive window from tip, verifies
-// scripts across the window in parallel, then commits each block in height
-// order. Must run on the blockHandler goroutine.
+// flushParallelValidate commits consecutive pending bodies from tip. Light
+// blocks use serial ProcessBlock; dense blocks use the pipelined verify
+// window. Must run on the blockHandler goroutine.
 func (sm *SyncManager) flushParallelValidate() {
 	sm.prunePendingValidate()
 	window := parallelValidatePoolSize()
 	for {
+		p := sm.pendingExtendingTip()
+		if p == nil {
+			return
+		}
+		if !shouldParallelValidate(sm.ibdMode, p.flags, p.bmsg.block) {
+			if !sm.flushSerialPending(p) {
+				sm.fillAllBlockRequests()
+				return
+			}
+			continue
+		}
 		batch := sm.collectParallelBatch(window)
 		if len(batch) == 0 {
 			return
 		}
 		if !sm.processParallelBatch(batch) {
-			// Soft-connect/script failure drops requested hashes; refill so
-			// IBD does not stall waiting for a block peers already sent.
 			sm.fillAllBlockRequests()
 			return
 		}
 	}
+}
+
+// pendingExtendingTip returns the pending body that extends the current tip
+// along the best-header path, or nil if that height is a gap.
+func (sm *SyncManager) pendingExtendingTip() *pendingIBDBlock {
+	if len(sm.pendingValidate) == 0 {
+		return nil
+	}
+	tip := sm.chain.BestSnapshot()
+	wantHash, err := sm.chain.HeaderHashByHeight(tip.Height + 1)
+	if err != nil {
+		return nil
+	}
+	p := sm.pendingValidate[*wantHash]
+	if p == nil {
+		return nil
+	}
+	if p.bmsg.block.MsgBlock().Header.PrevBlock != tip.Hash {
+		return nil
+	}
+	return p
+}
+
+func (sm *SyncManager) flushSerialPending(p *pendingIBDBlock) bool {
+	hash := *p.bmsg.block.Hash()
+	isCheckpoint, _ := sm.checkHeadersList(&hash)
+	ok := sm.processBlockSerial(p.bmsg, p.flags, isCheckpoint)
+	delete(sm.pendingValidate, hash)
+	return ok
 }
 
 // collectParallelBatch gathers up to window consecutive pending blocks
@@ -250,15 +290,19 @@ func (sm *SyncManager) collectParallelBatch(window int) []*pendingIBDBlock {
 		if p.bmsg.block.MsgBlock().Header.PrevBlock != parent {
 			break
 		}
+		if !shouldParallelValidate(sm.ibdMode, p.flags, p.bmsg.block) {
+			break
+		}
 		batch = append(batch, p)
 		parent = *wantHash
 	}
 	return batch
 }
 
-// processParallelBatch soft-connects the window, verifies scripts for all
-// blocks concurrently (shared NumCPU*3 worker budget), then commits in order.
-// Returns false if a block was rejected (pipeline stops for this flush).
+// processParallelBatch soft-connects the window, verifies each block with
+// the full serial script-worker budget (verifies stay DEPTH1 / serialized
+// against each other), then commits in height order. Returns false if a
+// block was rejected (pipeline stops for this flush).
 func (sm *SyncManager) processParallelBatch(batch []*pendingIBDBlock) bool {
 	view := sm.chain.NewTipUtxoView()
 	blocks := make([]*btcutil.Block, len(batch))
@@ -270,9 +314,7 @@ func (sm *SyncManager) processParallelBatch(batch []*pendingIBDBlock) bool {
 	// blocks are prefetched while the previous block's scripts verify so
 	// LevelDB miss latency overlaps sig CPU.
 	if err := sm.chain.PrefetchCacheInputs(blocks[:1]); err != nil {
-		sm.rejectPendingBlock(batch[0], err)
-		sm.dropPendingFrom(batch)
-		return false
+		log.Warnf("UTXO prefetch failed; continuing without prefetch: %v", err)
 	}
 
 	// Full serial script budget per concurrent block so a multi-block
@@ -293,12 +335,7 @@ func (sm *SyncManager) processParallelBatch(batch []*pendingIBDBlock) bool {
 	for i, p := range batch {
 		if waitPrefetch != nil {
 			if perr := waitPrefetch(); perr != nil {
-				if waitPrev != nil {
-					waitPrev()
-				}
-				sm.rejectPendingBlock(p, perr)
-				sm.dropPendingFrom(batch[i:])
-				break
+				log.Warnf("UTXO prefetch failed; continuing without prefetch: %v", perr)
 			}
 			waitPrefetch = nil
 		}
@@ -365,9 +402,9 @@ func (sm *SyncManager) processParallelBatch(batch []*pendingIBDBlock) bool {
 			sm.dropPendingFrom(batch[i:])
 			return false
 		}
-		// Soft-connect + scripts already enforced full connect rules; BFFastAdd
-		// skips re-running checkConnectBlock on the serial commit path.
-		flags := batch[i].flags | blockchain.BFFastAdd
+		// Soft-connect + scripts already ran; BFNoScriptCheck skips only
+		// scripts on commit and still runs the rest of checkConnectBlock.
+		flags := batch[i].flags | blockchain.BFNoScriptCheck
 		if !sm.commitParallelBlock(batch[i], flags) {
 			sm.dropPendingFrom(batch[i:])
 			return false
@@ -506,7 +543,7 @@ func (sm *SyncManager) finishBlockAccept(bmsg *blockMsg, peer *peerpkg.Peer,
 
 // processBlockSerial is the historical single-block ProcessBlock path.
 func (sm *SyncManager) processBlockSerial(bmsg *blockMsg, behaviorFlags blockchain.BehaviorFlags,
-	isCheckpointBlock bool) {
+	isCheckpointBlock bool) bool {
 
 	peer := bmsg.peer
 	blockHash := bmsg.block.Hash()
@@ -514,7 +551,8 @@ func (sm *SyncManager) processBlockSerial(bmsg *blockMsg, behaviorFlags blockcha
 	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
 	if err != nil {
 		sm.rejectPendingBlock(&pendingIBDBlock{bmsg: bmsg, flags: behaviorFlags}, err)
-		return
+		return false
 	}
 	sm.finishBlockAccept(bmsg, peer, blockHash, isOrphan, isCheckpointBlock)
+	return true
 }

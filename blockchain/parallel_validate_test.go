@@ -67,7 +67,7 @@ func TestSoftConnectAndVerifyExtendsTip(t *testing.T) {
 }
 
 // TestSoftConnectWindowParallelScripts soft-connects several tip extensions on
-// one view, verifies scripts concurrently, then commits with BFFastAdd.
+// one view, verifies scripts concurrently, then commits with BFNoScriptCheck.
 func TestSoftConnectWindowParallelScripts(t *testing.T) {
 	chain, tearDown, err := chainSetup("softwindow", &chaincfg.MainNetParams)
 	if err != nil {
@@ -118,9 +118,9 @@ func TestSoftConnectWindowParallelScripts(t *testing.T) {
 	}
 
 	for i := 0; i < window; i++ {
-		isMain, isOrphan, err := chain.ProcessBlock(blocks[warm+1+i], BFFastAdd)
+		isMain, isOrphan, err := chain.ProcessBlock(blocks[warm+1+i], BFNoScriptCheck)
 		if err != nil {
-			t.Fatalf("ProcessBlock BFFastAdd[%d]: %v", i, err)
+			t.Fatalf("ProcessBlock BFNoScriptCheck[%d]: %v", i, err)
 		}
 		if !isMain || isOrphan {
 			t.Fatalf("commit[%d]: isMain=%v isOrphan=%v", i, isMain, isOrphan)
@@ -496,7 +496,7 @@ func assertViewHasNoPendingTxOutputs(t *testing.T, view *UtxoViewpoint, blocks [
 
 // runParallelPipelineAtChainLayer mirrors netsync.processParallelBatch at the
 // blockchain layer: prefetch → soft-connect the window on a fresh tip view →
-// verify scripts concurrently → commit each in height order with BFFastAdd.
+// verify scripts concurrently → commit each in height order with BFNoScriptCheck.
 func runParallelPipelineAtChainLayer(chain *BlockChain, window []*btcutil.Block) error {
 	view := chain.NewTipUtxoView()
 	if err := chain.PrefetchBlocksInputs(view, window); err != nil {
@@ -531,7 +531,7 @@ func runParallelPipelineAtChainLayer(chain *BlockChain, window []*btcutil.Block)
 	}
 
 	for _, b := range window {
-		if _, _, err := chain.ProcessBlock(b, BFFastAdd); err != nil {
+		if _, _, err := chain.ProcessBlock(b, BFNoScriptCheck); err != nil {
 			return err
 		}
 	}
@@ -539,7 +539,7 @@ func runParallelPipelineAtChainLayer(chain *BlockChain, window []*btcutil.Block)
 }
 
 // TestParallelPipelineMatchesSerial is the consensus gate: the parallel
-// validation pipeline (soft-connect + VerifyBlockScripts + commit BFFastAdd)
+// validation pipeline (soft-connect + VerifyBlockScripts + commit BFNoScriptCheck)
 // must accept the same blocks and produce the same UTXO set as serial
 // ProcessBlock(BFNone). Any divergence is a consensus bug, not a perf
 // regression.

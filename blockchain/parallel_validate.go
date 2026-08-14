@@ -85,7 +85,7 @@ func (b *BlockChain) NewTipUtxoView() *UtxoViewpoint {
 //
 // This is intended for the serial UTXO-prep stage of parallel IBD validation.
 // Scripts are verified afterward via VerifyBlockScripts, then the block is
-// committed with ProcessBlock(..., BFFastAdd).
+// committed with ProcessBlock(..., BFNoScriptCheck).
 //
 // This function is safe for concurrent access with respect to the chain, but
 // the caller must not mutate view from another goroutine during the call.
@@ -272,14 +272,16 @@ func (b *BlockChain) PrefetchBlocksInputs(view *UtxoViewpoint, blocks []*btcutil
 // block N+1 overlaps script CPU of block N.
 //
 // Same consensus constraints as PrefetchBlocksInputs (no findInputsToFetch,
-// no inventing outputs). Safe w.r.t. the chain; may run while scripts verify.
+// no inventing outputs). Takes chainLock for writes because fetchEntries
+// mutates the live cache; script verify does not hold the lock, so this
+// still overlaps sig CPU.
 func (b *BlockChain) PrefetchCacheInputs(blocks []*btcutil.Block) error {
 	needed := collectPrefetchOutpoints(nil, blocks)
 	if len(needed) == 0 {
 		return nil
 	}
-	b.chainLock.RLock()
-	defer b.chainLock.RUnlock()
+	b.chainLock.Lock()
+	defer b.chainLock.Unlock()
 	_, err := b.utxoCache.fetchEntries(needed)
 	return err
 }

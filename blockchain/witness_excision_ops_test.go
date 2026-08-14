@@ -71,6 +71,8 @@ func TestStaleSideChainBodyDropped(t *testing.T) {
 
 	const buffer int32 = 5
 	chain.witnessBuffer = buffer
+	// Drop runs once per retarget in production; force every connect here.
+	chain.blocksPerRetarget = 1
 
 	genesis := btcutil.NewBlock(params.GenesisBlock)
 	genesis.SetHeight(0)
@@ -245,6 +247,3 @@ func TestReconsiderColdAttachPreservesInvalidStatus(t *testing.T) {
 			"status must be preserved until reconsider can proceed")
 	}
 }
-
-
-

@@ -106,6 +106,40 @@ func TestScriptWorkersPerBlockFullBudgetPerBlock(t *testing.T) {
 	}
 }
 
+func TestLightThenHeavyFlushOrder(t *testing.T) {
+	light := &pendingIBDBlock{bmsg: &blockMsg{block: mkBlockWithInputs(0)}}
+	heavy := &pendingIBDBlock{bmsg: &blockMsg{block: mkBlockWithInputs(parallelValidateMinSigs)}}
+	heavy2 := &pendingIBDBlock{bmsg: &blockMsg{block: mkBlockWithInputs(parallelValidateMinSigs + 8)}}
+
+	if !shouldEnqueueIBD(true, blockchain.BFNone) {
+		t.Fatal("non-fast-add IBD bodies must enqueue")
+	}
+
+	// Heavy H+2 arrived first and is queued behind light H+1. Flush must
+	// serial-commit the light tip-extender and leave the heavy for the
+	// next iteration — not drop it or skip the light.
+	kind, batch := nextIBDFlush(true, []*pendingIBDBlock{light, heavy, heavy2}, 32)
+	if kind != ibdFlushSerial || len(batch) != 1 || batch[0] != light {
+		t.Fatalf("light-then-heavy: want serial light, got kind=%d n=%d", kind, len(batch))
+	}
+	kind, batch = nextIBDFlush(true, []*pendingIBDBlock{heavy, heavy2}, 32)
+	if kind != ibdFlushPipeline || len(batch) != 2 || batch[0] != heavy || batch[1] != heavy2 {
+		t.Fatalf("after light: want pipeline [heavy,heavy2], got kind=%d n=%d", kind, len(batch))
+	}
+
+	// Dense run stops before a later light so that light is not pulled into
+	// the pipeline window.
+	kind, batch = nextIBDFlush(true, []*pendingIBDBlock{heavy, light, heavy2}, 32)
+	if kind != ibdFlushPipeline || len(batch) != 1 || batch[0] != heavy {
+		t.Fatalf("heavy-then-light: want pipeline [heavy], got kind=%d n=%d", kind, len(batch))
+	}
+
+	kind, batch = nextIBDFlush(true, nil, 32)
+	if kind != ibdFlushNone || batch != nil {
+		t.Fatalf("empty: want none, got kind=%d n=%d", kind, len(batch))
+	}
+}
+
 func TestFindPendingExtendingOOO(t *testing.T) {
 	sm := &SyncManager{
 		pendingValidate: make(map[chainhash.Hash]*pendingIBDBlock),

@@ -757,9 +757,9 @@ func (b *BlockChain) ageOutFallenWindow(dbTx database.Tx, node *blockNode) error
 		return fmt.Errorf("age-out: IsColdBlock %s: %v", ageOutNode.hash, err)
 	}
 	if alreadyCold {
-		if err := b.rewriteAlreadyColdAgeOut(dbTx, ageOutNode, ageOutHeight); err != nil {
-			return err
-		}
+		// Cold-direct IBD already indexed with stripped offsets at connect.
+		// A failed hot-compact rewrite leaves the block hot (CancelPending),
+		// so this path is not a rewrite retry. Skip fetch/decompress.
 		b.maybeReclaimHotSpace(cc, node.height)
 		return b.maybeDropStaleSideChains(dbTx, node.height, ageOutHeight)
 	}
@@ -828,42 +828,6 @@ func (b *BlockChain) compactHotAgeOut(dbTx database.Tx, cc database.ColdCompacto
 		return err
 	}
 	b.maybeReclaimHotSpace(cc, node.height)
-	return nil
-}
-
-// rewriteAlreadyColdAgeOut retries offset-bearing index rewrite for a block
-// that is already on the cold tier (IBD StoreBlockCold, or a prior compact
-// whose rewrite failed). Compact is skipped; FetchBlock returns stripped
-// bytes, which is the idempotent rewrite input. Failure is logged and does
-// not fail tip connect — the body is already committed cold.
-func (b *BlockChain) rewriteAlreadyColdAgeOut(dbTx database.Tx, ageOutNode *blockNode,
-	ageOutHeight int32) error {
-
-	if b.indexManager == nil {
-		return nil
-	}
-	cm, ok := b.indexManager.(ColdCompactionIndexManager)
-	if !ok {
-		return nil
-	}
-	ageOutBlockBytes, err := dbTx.FetchBlock(&ageOutNode.hash)
-	if err != nil {
-		return fmt.Errorf("age-out: fetch already-cold block %s: %v", ageOutNode.hash, err)
-	}
-	ageOutBlock, err := btcutil.NewBlockFromBytes(ageOutBlockBytes)
-	if err != nil {
-		return fmt.Errorf("age-out: parse already-cold block %s: %v", ageOutNode.hash, err)
-	}
-	ageOutStxos, stxoErr := dbFetchSpendJournalEntry(dbTx, ageOutBlock)
-	if stxoErr != nil {
-		log.Debugf("Skipping already-cold index rewrite of block %s (height %d): "+
-			"spend journal unavailable (%v)", ageOutNode.hash, ageOutHeight, stxoErr)
-		return nil
-	}
-	if err := cm.RewriteTxOffsetsForColdCompaction(dbTx, ageOutBlock, ageOutStxos); err != nil {
-		log.Warnf("Already-cold index rewrite of block %s (height %d) failed (%v); "+
-			"left cold", ageOutNode.hash, ageOutHeight, err)
-	}
 	return nil
 }
 

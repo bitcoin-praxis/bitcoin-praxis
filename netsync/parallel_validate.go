@@ -217,47 +217,53 @@ func (sm *SyncManager) flushParallelValidate() {
 	sm.prunePendingValidate()
 	window := parallelValidatePoolSize()
 	for {
-		p := sm.pendingExtendingTip()
-		if p == nil {
+		kind, batch := nextIBDFlush(sm.ibdMode, sm.collectConsecutivePending(window), window)
+		switch kind {
+		case ibdFlushNone:
 			return
-		}
-		if !shouldParallelValidate(sm.ibdMode, p.flags, p.bmsg.block) {
-			if !sm.flushSerialPending(p) {
+		case ibdFlushSerial:
+			if !sm.flushSerialPending(batch[0]) {
 				sm.fillAllBlockRequests()
 				return
 			}
-			continue
-		}
-		batch := sm.collectParallelBatch(window)
-		if len(batch) == 0 {
-			return
-		}
-		if !sm.processParallelBatch(batch) {
-			sm.fillAllBlockRequests()
-			return
+		case ibdFlushPipeline:
+			if !sm.processParallelBatch(batch) {
+				sm.fillAllBlockRequests()
+				return
+			}
 		}
 	}
 }
 
-// pendingExtendingTip returns the pending body that extends the current tip
-// along the best-header path, or nil if that height is a gap.
-func (sm *SyncManager) pendingExtendingTip() *pendingIBDBlock {
-	if len(sm.pendingValidate) == 0 {
-		return nil
+type ibdFlushKind int
+
+const (
+	ibdFlushNone ibdFlushKind = iota
+	ibdFlushSerial
+	ibdFlushPipeline
+)
+
+// nextIBDFlush decides how to commit the next consecutive pending bodies.
+// A light tip-extender is serial; a dense run is pipelined up to window,
+// stopping before the first light block so it is not stranded.
+func nextIBDFlush(ibd bool, consecutive []*pendingIBDBlock, window int) (ibdFlushKind, []*pendingIBDBlock) {
+	if len(consecutive) == 0 {
+		return ibdFlushNone, nil
 	}
-	tip := sm.chain.BestSnapshot()
-	wantHash, err := sm.chain.HeaderHashByHeight(tip.Height + 1)
-	if err != nil {
-		return nil
+	if !shouldParallelValidate(ibd, consecutive[0].flags, consecutive[0].bmsg.block) {
+		return ibdFlushSerial, consecutive[:1]
 	}
-	p := sm.pendingValidate[*wantHash]
-	if p == nil {
-		return nil
+	n := 0
+	for n < len(consecutive) && n < window {
+		if !shouldParallelValidate(ibd, consecutive[n].flags, consecutive[n].bmsg.block) {
+			break
+		}
+		n++
 	}
-	if p.bmsg.block.MsgBlock().Header.PrevBlock != tip.Hash {
-		return nil
+	if n == 0 {
+		return ibdFlushNone, nil
 	}
-	return p
+	return ibdFlushPipeline, consecutive[:n]
 }
 
 func (sm *SyncManager) flushSerialPending(p *pendingIBDBlock) bool {
@@ -268,9 +274,10 @@ func (sm *SyncManager) flushSerialPending(p *pendingIBDBlock) bool {
 	return ok
 }
 
-// collectParallelBatch gathers up to window consecutive pending blocks
+// collectConsecutivePending gathers up to window consecutive pending blocks
 // extending the current tip along the best-header path (not an arbitrary fork).
-func (sm *SyncManager) collectParallelBatch(window int) []*pendingIBDBlock {
+// Light and dense bodies are both included; nextIBDFlush splits the run.
+func (sm *SyncManager) collectConsecutivePending(window int) []*pendingIBDBlock {
 	if len(sm.pendingValidate) == 0 {
 		return nil
 	}
@@ -288,9 +295,6 @@ func (sm *SyncManager) collectParallelBatch(window int) []*pendingIBDBlock {
 			break
 		}
 		if p.bmsg.block.MsgBlock().Header.PrevBlock != parent {
-			break
-		}
-		if !shouldParallelValidate(sm.ibdMode, p.flags, p.bmsg.block) {
 			break
 		}
 		batch = append(batch, p)

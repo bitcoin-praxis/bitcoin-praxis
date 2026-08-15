@@ -14,18 +14,21 @@ Wiring: root `go.mod` must `replace github.com/btcsuite/btcd/txscript/v2 => ./tx
 
 1. Serial soft-connect (`SoftConnectNext` / `SoftConnectNextAfter`) builds a UTXO view without running scripts.
 2. Parallel `VerifyBlockScripts` on an isolated snapshot (nested workers via `SetScriptCheckWorkers`).
-3. Serial `ProcessBlock(..., BFFastAdd)` commits height order.
-4. Light blocks stay on the serial `ProcessBlock` path (`shouldParallelValidate`).
+3. Serial `ProcessBlock(..., BFNoScriptCheck)` commits height order.
+4. Every non-`BFFastAdd` IBD body is enqueued (`shouldEnqueueIBD`). The sig
+   heuristic (`shouldParallelValidate`) only chooses serial vs pipelined verify.
 
 ## Unit coverage
 
 | Test | Location | Verifies |
 |---|---|---|
 | `TestSoftConnectAndVerifyExtendsTip` | `blockchain/parallel_validate_test.go` | Soft-connect + scripts + `BFNoScriptCheck` commit |
-| `TestSoftConnectWindowParallelScripts` | `blockchain/parallel_validate_test.go` | Multi-height window + `BFFastAdd` commit |
+| `TestSoftConnectWindowParallelScripts` | `blockchain/parallel_validate_test.go` | Multi-height window + `BFNoScriptCheck` commit |
 | `TestScriptCheckWorkersBudget` | `blockchain/parallel_validate_test.go` | Nested worker budget |
 | `TestParallelPipelineMatchesSerial` | `blockchain/parallel_validate_test.go` | Same UTXO fingerprint as serial |
-| `TestShouldParallelValidate` | `netsync/parallel_validate_test.go` | IBD gating vs `BFFastAdd` |
+| `TestShouldEnqueueIBD` | `netsync/parallel_validate_test.go` | All non-fast-add IBD bodies enqueue |
+| `TestShouldParallelValidate` | `netsync/parallel_validate_test.go` | Sig heuristic vs `BFFastAdd` |
+| `TestLightThenHeavyFlushOrder` | `netsync/parallel_validate_test.go` | Light H+1 does not strand heavy H+2 |
 | `TestFindPendingExtendingOOO` | `netsync/parallel_validate_test.go` | Out-of-order pending lookup |
 | `TestVerify*MatchesBtcec` | `txscript/secp256k1verify` | libsecp vs `btcec` on valid + tampered inputs |
 | `TestUtxoCacheKeepHotEvictsWhenFull` | `blockchain/utxocache_test.go` | Size flush keeps a budgeted working set |

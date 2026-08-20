@@ -200,7 +200,8 @@ func budgetedMapEntries(maxTotalMemoryUsage uint64) int {
 // compact rebuilds the map slice as a single budgeted map so Go can release
 // extra maps and empty buckets after a keep-hot eviction. Hint is the
 // budgeted cap (same as startup), not 2× remaining entries — that overflowed
-// the cache limit and OOM'd a 15GiB IBD box.
+// the cache limit and OOM'd a 15GiB IBD box. Sizing to remaining leftover
+// overflowed into extra maps on the next fill and ran ~14% behind the B wall.
 func (ms *mapSlice) compact() {
 	ms.mtx.Lock()
 	defer ms.mtx.Unlock()
@@ -243,6 +244,12 @@ const (
 	// after a size-triggered flush. Periodic flushes that are under the
 	// cap keep the full working set.
 	utxoCacheKeepFraction = 2
+
+	// utxoDirtyFlushFraction persists dirty entries at max/N only while
+	// the cache is filling from empty (genesis or reconstruct). A full-cap
+	// dirty batch plus the live cache OOM'd 15GiB IBD. After keep-hot,
+	// persist only at cap — same cadence as the 2.9× B run.
+	utxoDirtyFlushFraction = 4
 )
 
 // FlushMode is used to indicate the different urgency types for a flush.
@@ -280,11 +287,15 @@ type utxoCache struct {
 	cachedEntries    mapSlice
 	totalEntryMemory uint64 // Total memory usage in bytes.
 
-	// pendingKeepHotCompact is set when a size-triggered keep-hot flush
-	// evicted in-place and still needs compact() after the DB txn commits.
-	// Compacting inside the txn OOM'd IBD: the 2×-hint map plus the write
-	// batch blew a 15GiB box and rolled the UTXO flush back to genesis.
+	// pendingKeepHotCompact is set when a keep-hot flush still needs
+	// compact() after the DB txn commits. Compacting inside the txn
+	// OOM'd IBD: the extra map plus the write batch blew a 15GiB box.
 	pendingKeepHotCompact bool
+
+	// keptEntryMemory is entry bytes retained after the last keep-hot
+	// flush. Dirty growth is totalEntryMemory minus this; used to flush
+	// before a full-cap persist batch.
+	keptEntryMemory uint64
 
 	// flushApply holds cache mutations that must wait until db.Update
 	// commits. Applying markFlushed / spent-eviction inside the txn left
@@ -732,6 +743,7 @@ func (s *utxoCache) applyFlushMemory() {
 	if apply.keepHot {
 		s.applyKeepHotMemory()
 		s.finishKeepHot(apply.atCap)
+		s.keptEntryMemory = s.totalEntryMemory
 		keptMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
 		log.Infof("UTXO cache kept %d MiB with %d entries after flush",
 			keptMiB, s.cachedEntries.length())
@@ -742,9 +754,37 @@ func (s *utxoCache) applyFlushMemory() {
 	s.lastFlushTime = time.Now()
 }
 
+func (s *utxoCache) dirtyEntryMemory() uint64 {
+	if s.totalEntryMemory > s.keptEntryMemory {
+		return s.totalEntryMemory - s.keptEntryMemory
+	}
+	return 0
+}
+
+func (s *utxoCache) dirtyFlushLimit() uint64 {
+	limit := s.maxTotalMemoryUsage / utxoDirtyFlushFraction
+	if limit < 1 {
+		return 1
+	}
+	return limit
+}
+
+func (s *utxoCache) dirtyNeedsFlush(mode FlushMode) bool {
+	if mode == FlushRequired {
+		return false
+	}
+	// Chunked persist is only for first fill / reconstruct from 0.
+	// After keep-hot, match B: persist only at cap.
+	if s.keptEntryMemory > 0 {
+		return false
+	}
+	return s.dirtyEntryMemory() >= s.dirtyFlushLimit()
+}
+
 func (s *utxoCache) emptyCache() {
 	s.cachedEntries.deleteMaps()
 	s.totalEntryMemory = 0
+	s.keptEntryMemory = 0
 }
 
 // writeCache persists dirty UTXO entries. FlushRequired empties the cache.
@@ -796,7 +836,7 @@ func (s *utxoCache) flush(dbTx database.Tx, mode FlushMode, bestState *BestState
 		}
 	}
 
-	if s.totalMemoryUsage() >= threshold {
+	if s.totalMemoryUsage() >= threshold || s.dirtyNeedsFlush(mode) {
 		// Add one to round up the integer division.
 		totalMiB := s.totalMemoryUsage() / ((1024 * 1024) + 1)
 		keepHot := mode != FlushRequired

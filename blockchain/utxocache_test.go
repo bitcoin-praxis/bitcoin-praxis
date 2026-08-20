@@ -1117,3 +1117,56 @@ func TestMapSliceCompactUsesBudgetedCap(t *testing.T) {
 		t.Fatalf("map size %d exceeds budget %d", ms.size(), maxMem)
 	}
 }
+
+func TestFlushIfNeededWritesDirtyBeforeCap(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestFlushIfNeededWritesDirtyBeforeCap")
+	defer tearDown()
+	cache := chain.utxoCache
+	cache.maxTotalMemoryUsage = 64 * 1024
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	var n int
+	for cache.dirtyEntryMemory() < cache.dirtyFlushLimit() {
+		op := outpointFromInt(n)
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		if err := cache.addTxOut(op, &txOut, true, int32(n)); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if cache.totalMemoryUsage() >= cache.maxTotalMemoryUsage {
+			t.Fatal("test setup hit the cap before the dirty flush limit")
+		}
+	}
+	if cache.totalMemoryUsage() >= cache.maxTotalMemoryUsage {
+		t.Fatal("dirty flush must fire below the cap")
+	}
+
+	cache.lastFlushHash[0] ^= 0xff
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushIfNeeded, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.afterFlushCommit()
+
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+	if cache.dirtyEntryMemory() != 0 {
+		t.Fatalf("dirty %d after keep-hot flush", cache.dirtyEntryMemory())
+	}
+	if cache.keptEntryMemory == 0 {
+		t.Fatal("keptEntryMemory should be set after keep-hot")
+	}
+
+	op := outpointFromInt(n)
+	txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+	if err := cache.addTxOut(op, &txOut, true, int32(n)); err != nil {
+		t.Fatal(err)
+	}
+	if cache.dirtyNeedsFlush(FlushIfNeeded) {
+		t.Fatal("one extra entry must not retrigger a 512MiB-scale dirty flush")
+	}
+}

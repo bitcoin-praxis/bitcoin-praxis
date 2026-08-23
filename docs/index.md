@@ -11,8 +11,8 @@ mining work live below or beside the consensus layer.
 * [M2 test plan](M2_TEST_PLAN.md) — parallel validation, libsecp, UTXO cache, mainnet IBD
 
 libsecp256k1 (cgo) is the default verify backend on non-Windows (~4× per-sig,
-~2.4× validation wall). Nocheckpoints IBD is **~4×** uncompressed and **~3×**
-with the default witness-buffer. See the M2 test plan.
+~2.4× validation wall). Nocheckpoints IBD is **3×** with the default
+witness-buffer and **~4×** uncompressed. See the M2 test plan.
 
 ## Contents
 

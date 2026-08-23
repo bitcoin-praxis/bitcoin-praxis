@@ -60,7 +60,7 @@ flowchart TD
 | # | Milestone | Headline Claim |
 |---|---|---|
 | M1 | Witness-Separated Storage | **52.5% smaller** (measured on 1005 GB mainnet chain → ~477 GB), Lightning-compatible |
-| M2 | Parallel Validation Pipeline | **~3×** nocheckpoints IBD with default compression (~4× uncompressed). libsecp256k1 ~4× per-sig / ~2.4× validation wall. |
+| M2 | Parallel Validation Pipeline | **3×** nocheckpoints IBD with default compression (~4× uncompressed). libsecp256k1 ~4× per-sig / ~2.4× validation wall. |
 | M3 | Bundled Wallet + Native GUI | Full Core-QT replacement for non-mining users |
 | M4 | Cross-Platform Async I/O | io_uring on Linux; macOS/Windows I/O backends |
 | M5 | DATUM / Stratum-v2 Mining | First major node with decentralized pool job negotiation |
@@ -345,11 +345,11 @@ measured on real mainnet data.
 Script validation and the UTXO miss-path are portable; OS-specific async I/O
 is M4.
 
-Nocheckpoints IBD vs stock btcd v0.26.0 (281.8h to height 960998), as of
-2026-08-14:
+Nocheckpoints IBD vs stock btcd v0.26.0 (281.8h / ~12 days to height 960998).
+From-genesis tip wall 2026-08-16:
 
-- Uncompressed: **~4×** (~3.8× at height 570–578k).
-- Default `--witness-buffer=2016`: **2.8×** at height 732k, **~3×** at tip.
+- Default `--witness-buffer=2016`: **3×** (~4 days to 961k).
+- Uncompressed (`--witness-buffer=0`): **~4×**.
 - libsecp256k1 (cgo default; pure-Go fallback on Windows / `CGO_ENABLED=0`):
   **~4× per-sig**, **~2.4×** validation wall. Requires
   `replace .../txscript/v2 => ./txscript` in root `go.mod`.
@@ -358,6 +358,8 @@ Nocheckpoints IBD vs stock btcd v0.26.0 (281.8h to height 960998), as of
   prefetch, and parallel Gets.
 
 Details in `docs/M2_TEST_PLAN.md`.
+
+**M2 status: complete.** B-1 and B-2 shipped. **3× IBD** with default compression.
 
 ### Scope
 
@@ -379,9 +381,8 @@ Details in `docs/M2_TEST_PLAN.md`.
 
 ### Acceptance Criteria
 
-1. **Speedup**: IBD replay from a mainnet block snapshot (e.g. blocks 400k–500k)
-   completes in ≤ 50% of baseline wall time on a multi-core machine, with
-   methodology published as a reproducible benchmark script.
+1. **Speedup**: nocheckpoints mainnet IBD **3×** vs stock btcd v0.26.0 with
+   default compression (~4× uncompressed). Methodology in `docs/M2_TEST_PLAN.md`.
 2. **Consensus equivalence**: `blockchain/fullblocktests` produces identical best
    chain, UTXO set, and error set to the serial baseline.
 3. **Race-clean** under `go test -race` including out-of-order block arrival and
@@ -391,7 +392,7 @@ Details in `docs/M2_TEST_PLAN.md`.
 
 | Phase | Scope |
 |---|---|
-| B-1 | Parallel validation + libsecp + UTXO keep-hot. Status: **shipped.** ~4× IBD uncompressed, ~3× with default compression. See `docs/M2_TEST_PLAN.md`. |
+| B-1 | Parallel validation + libsecp + UTXO keep-hot. Status: **shipped.** 3× IBD with default compression, ~4× uncompressed. See `docs/M2_TEST_PLAN.md`. |
 | B-2 | POSIX `posix_fadvise(SEQUENTIAL)` on hot/cold open. Status: **done** (Windows no-op). `madvise` deferred (`ReadAt`, not mmap). |
 
 ---

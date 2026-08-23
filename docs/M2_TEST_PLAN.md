@@ -33,6 +33,7 @@ Wiring: root `go.mod` must `replace github.com/btcsuite/btcd/txscript/v2 => ./tx
 | `TestVerify*MatchesBtcec` | `txscript/secp256k1verify` | libsecp vs `btcec` on valid + tampered inputs |
 | `TestUtxoCacheKeepHotEvictsWhenFull` | `blockchain/utxocache_test.go` | Size flush keeps a budgeted working set |
 | `TestMapSliceCompactUsesBudgetedCap` | `blockchain/utxocache_test.go` | Compact uses startup map cap, not 2× remaining |
+| `TestFlushIfNeededWritesDirtyBeforeCap` | `blockchain/utxocache_test.go` | Empty-fill dirty flush at max/4; cap-only after keep-hot |
 | `go test -race ./blockchain/ ./netsync/` | CI | Race-clean |
 | `TestFullBlocks` | `blockchain/fullblocks_test.go` | Consensus suite unchanged |
 
@@ -65,21 +66,30 @@ Full-validation A/B vs stock btcd **v0.26.0**. Checkpoints skip scripts below th
 |---|---|---|
 | Binary | btcd v0.26.0 | `praxisd` with libsecp + parallel validate + UTXO opts |
 | Flags | `--nocheckpoints`, sole `connect=` to a local Core | same; compression uses default `witness-buffer=2016` |
-| Stock wall | **11d 17h 51m ≈ 281.8h** to height **960998** | — |
+| Stock wall | **~12 days** to height **960998** | **~4 days** to 961k (**3×**) |
 
-**Uncompressed** (keep-hot + 2 GiB UTXO cache): **~4×** (~3.8× at height 570–578k).
+Default compression (`--witness-buffer=2016`) is **3×** vs stock: ~12 days to
+961k vs ~4 days on the same machine, same sole LAN Core peer,
+`--nocheckpoints`. Keep witness and the same opts are **~4×**.
 
-**Default compression** (`witness-buffer=2016`): same speed opts. Age-out skips already-cold bodies; stale-side-chain scans run once per retarget; keep-hot compact uses the budgeted map cap **after** the UTXO flush commits.
+**Default compression** (`witness-buffer=2016`): keep-hot + 2 GiB UTXO cache +
+libsecp + parallel validate. Age-out skips already-cold bodies; stale-side-chain
+scans run once per retarget; keep-hot compact uses the budgeted map cap
+**after** the UTXO flush commits. Empty-fill (genesis / reconstruct) persists
+dirty at max/4 so a 2 GiB first batch cannot OOM a 15 GiB box; after keep-hot,
+persist is cap-only.
 
+From-genesis wall (2026-08-16): height **962472**. Same-height **961k vs stock
+960998: 3×**. A later resume with the empty-fill guard reached live tip
+(2026-08-22, height 963251) on the same cadence.
 
 | Height | vs stock |
 |---|---|
-| ~410k | **2.0×** |
-| ~581k | **2.4×** |
-| ~663k | **2.7×** |
-| ~732k | **2.8×** |
-
-Dense tail still dominates stock's remaining wall. **~3×** with default compression at tip.
+| ~410k | 2.0× |
+| ~581k | 2.4× |
+| ~663k | 2.7× |
+| ~732k | 2.8× |
+| **961k (tip wall)** | **3×** |
 
 ### UTXO opts
 
@@ -87,7 +97,7 @@ Live IBD was LevelDB UTXO-miss bound (`pendingValidate=0`), not sig-bound:
 
 1. Parallel LevelDB Gets on ≥32 misses (`fetchMissingFromDB`, up to 8 workers).
 2. Prefetch inputs for N+1 during Verify(N). Must **not** use `findInputsToFetch` (BIP30 height−1 poison).
-3. Keep-hot flush: persist dirty, keep unspent, evict to 50% entry budget **and** a single budgeted map when at cap; compact after the DB transaction commits.
+3. Keep-hot flush: persist dirty, keep unspent, evict to 50% entry budget **and** a single budgeted map when at cap; compact after the DB transaction commits. Empty-fill dirty flush at max/4; cap-only after keep-hot.
 
 Consensus: `TestParallelPipelineMatchesSerial`, `TestVerify*MatchesBtcec`. LND / Neutrino unaffected.
 
@@ -98,5 +108,5 @@ Consensus: `TestParallelPipelineMatchesSerial`, `TestVerify*MatchesBtcec`. LND /
 - [x] UTXO prefetch + parallel Gets + keep-hot (budgeted compact after commit)
 - [x] Cold-cache `fullvaltip`
 - [x] Testnet4 sole-LAN ≈ serial (fetch-bound)
-- [ ] Compression-B mainnet nocheckpoints tip wall vs stock 281.8h
+- [x] Mainnet nocheckpoints tip wall vs stock: **3×** (default compression)
 - [x] POSIX `posix_fadvise(SEQUENTIAL)` on hot/cold open (Windows no-op)

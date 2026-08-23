@@ -140,6 +140,34 @@ func TestLightThenHeavyFlushOrder(t *testing.T) {
 	}
 }
 
+func TestPendingKeepRangeIncludesReorgPrefix(t *testing.T) {
+	// Linear IBD: fork is the current tip; keep from tip+1.
+	start, maxHeight := pendingKeepRange(15, 30, 8)
+	if start != 16 || maxHeight != 23 {
+		t.Fatalf("linear: start=%d max=%d, want 16,23", start, maxHeight)
+	}
+
+	// Reorg: shorter tip at 15, longer headers at 30, fork at 10.
+	// Bodies 11-15 are at or below tip and must stay queued.
+	start, maxHeight = pendingKeepRange(10, 30, 224)
+	if start != 11 {
+		t.Fatalf("reorg start=%d, want 11 (fork+1, not tip+1)", start)
+	}
+	if maxHeight != 30 {
+		t.Fatalf("reorg max=%d, want 30", maxHeight)
+	}
+
+	start, maxHeight = pendingKeepRange(0, 100, 10)
+	if start != 1 || maxHeight != 10 {
+		t.Fatalf("genesis: start=%d max=%d, want 1,10", start, maxHeight)
+	}
+
+	start, maxHeight = pendingKeepRange(30, 30, 224)
+	if start <= 30 && start <= maxHeight {
+		t.Fatalf("caught up: start=%d max=%d, want empty range", start, maxHeight)
+	}
+}
+
 func TestFindPendingExtendingOOO(t *testing.T) {
 	sm := &SyncManager{
 		pendingValidate: make(map[chainhash.Hash]*pendingIBDBlock),

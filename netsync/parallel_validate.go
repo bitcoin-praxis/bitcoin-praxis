@@ -124,30 +124,76 @@ func (sm *SyncManager) enqueueParallelBlock(bmsg *blockMsg, flags blockchain.Beh
 	sm.prunePendingValidate()
 }
 
+// pendingKeepRange is the best-header-path height range whose bodies may sit
+// in pendingValidate. Start is the first header after the best-chain /
+// best-header fork, not tip+1: a reorg prefix lives at or below the current
+// tip height and must be kept until ProcessBlock can walk the side chain.
+func pendingKeepRange(forkHeight, headerHeight int32, capN int) (start, maxHeight int32) {
+	start = forkHeight + 1
+	if start < 1 {
+		start = 1
+	}
+	maxHeight = start + int32(capN) - 1
+	if maxHeight > headerHeight {
+		maxHeight = headerHeight
+	}
+	return start, maxHeight
+}
+
+func (sm *SyncManager) pendingKeepBounds() (start, maxHeight int32) {
+	_, headerHeight := sm.chain.BestHeader()
+	return pendingKeepRange(
+		sm.chain.BestChainHeaderForkHeight(),
+		headerHeight,
+		maxPendingValidate,
+	)
+}
+
+// forgetPendingBody drops an uncommitted IBD body and lets a later getdata
+// copy through QueueBlock. markDelivered runs before enqueue; if prune then
+// discards the body, leaving recentDelivered set would drop the re-fetch
+// forever (reorg prefix stall: tip=15, lasthdr=30, inflight=0).
+func (sm *SyncManager) forgetPendingBody(hash chainhash.Hash) {
+	delete(sm.pendingValidate, hash)
+	sm.recentDelivered.Delete(hash)
+}
+
+func (sm *SyncManager) hasPendingValidate(hash chainhash.Hash) bool {
+	if sm.pendingValidate == nil {
+		return false
+	}
+	_, ok := sm.pendingValidate[hash]
+	return ok
+}
+
+func (sm *SyncManager) headerHashAt(height int32) (chainhash.Hash, error) {
+	hash, err := sm.chain.HeaderHashByHeight(height)
+	if err != nil {
+		return chainhash.Hash{}, err
+	}
+	return *hash, nil
+}
+
 // prunePendingValidate drops full block bodies that can never (or should not)
-// be soft-connected from the current tip: off best-header-path, already behind
-// tip, or beyond the in-flight lookahead cap. Far-ahead on-path bodies that
-// exceed maxPendingValidate are discarded and requeued for fetch so memory
-// stays bounded under peer churn.
+// be connected along the best header path: off-path, already behind the
+// chain/header fork, or beyond the in-flight lookahead cap. Far-ahead on-path
+// bodies that exceed maxPendingValidate are discarded and requeued for fetch
+// so memory stays bounded under peer churn.
 func (sm *SyncManager) prunePendingValidate() {
 	if len(sm.pendingValidate) == 0 {
 		return
 	}
 
-	tip := sm.chain.BestSnapshot()
-	_, headerHeight := sm.chain.BestHeader()
-	maxHeight := tip.Height + int32(maxPendingValidate)
-	if maxHeight > headerHeight {
-		maxHeight = headerHeight
-	}
-
+	start, maxHeight := sm.pendingKeepBounds()
 	onPath := make(map[chainhash.Hash]int32, maxPendingValidate)
-	for h := tip.Height + 1; h <= maxHeight; h++ {
-		hash, err := sm.chain.HeaderHashByHeight(h)
-		if err != nil {
-			break
+	if start <= maxHeight {
+		for h := start; h <= maxHeight; h++ {
+			hash, err := sm.chain.HeaderHashByHeight(h)
+			if err != nil {
+				break
+			}
+			onPath[*hash] = h
 		}
-		onPath[*hash] = h
 	}
 
 	var droppedOffPath int
@@ -155,7 +201,7 @@ func (sm *SyncManager) prunePendingValidate() {
 		if _, ok := onPath[hash]; ok {
 			continue
 		}
-		delete(sm.pendingValidate, hash)
+		sm.forgetPendingBody(hash)
 		droppedOffPath++
 	}
 
@@ -179,7 +225,7 @@ func (sm *SyncManager) prunePendingValidate() {
 			if len(sm.pendingValidate) <= maxPendingValidate {
 				break
 			}
-			delete(sm.pendingValidate, it.hash)
+			sm.forgetPendingBody(it.hash)
 			sm.priorityBlocks[it.hash] = struct{}{}
 			droppedFar++
 		}
@@ -220,6 +266,9 @@ func (sm *SyncManager) flushParallelValidate() {
 		kind, batch := nextIBDFlush(sm.ibdMode, sm.collectConsecutivePending(window), window)
 		switch kind {
 		case ibdFlushNone:
+			// Gap at the fork/tip: keep fetching the missing prefix
+			// instead of sitting on later pending bodies with inflight=0.
+			sm.fillAllBlockRequests()
 			return
 		case ibdFlushSerial:
 			if !sm.flushSerialPending(batch[0]) {
@@ -275,30 +324,42 @@ func (sm *SyncManager) flushSerialPending(p *pendingIBDBlock) bool {
 }
 
 // collectConsecutivePending gathers up to window consecutive pending blocks
-// extending the current tip along the best-header path (not an arbitrary fork).
+// along the best-header path from the chain/header fork. Side-chain connects
+// during a reorg do not move the tip until the new chain has more work, so
+// already-HaveBlock hashes are skipped rather than treated as a gap.
 // Light and dense bodies are both included; nextIBDFlush splits the run.
 func (sm *SyncManager) collectConsecutivePending(window int) []*pendingIBDBlock {
-	if len(sm.pendingValidate) == 0 {
+	if len(sm.pendingValidate) == 0 || window <= 0 {
 		return nil
 	}
-	tip := sm.chain.BestSnapshot()
-	parent := tip.Hash
+	start, maxHeight := sm.pendingKeepBounds()
+	if start > maxHeight {
+		return nil
+	}
+	parent, err := sm.headerHashAt(start - 1)
+	if err != nil {
+		return nil
+	}
 	batch := make([]*pendingIBDBlock, 0, window)
-	for len(batch) < window {
-		nextHeight := tip.Height + int32(len(batch)) + 1
-		wantHash, err := sm.chain.HeaderHashByHeight(nextHeight)
+	for h := start; h <= maxHeight && len(batch) < window; h++ {
+		want, err := sm.headerHashAt(h)
 		if err != nil {
 			break
 		}
-		p := sm.pendingValidate[*wantHash]
+		p := sm.pendingValidate[want]
 		if p == nil {
-			break
+			have, herr := sm.chain.HaveBlock(&want)
+			if herr != nil || !have {
+				break
+			}
+			parent = want
+			continue
 		}
 		if p.bmsg.block.MsgBlock().Header.PrevBlock != parent {
 			break
 		}
 		batch = append(batch, p)
-		parent = *wantHash
+		parent = want
 	}
 	return batch
 }

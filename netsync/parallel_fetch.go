@@ -456,10 +456,8 @@ func (sm *SyncManager) isLateRaceBlock(hash *chainhash.Hash) bool {
 	if hash == nil {
 		return false
 	}
-	if sm.pendingValidate != nil {
-		if _, ok := sm.pendingValidate[*hash]; ok {
-			return true
-		}
+	if sm.hasPendingValidate(*hash) {
+		return true
 	}
 	have, err := sm.haveInventory(wire.NewInvVect(wire.InvTypeBlock, hash))
 	return err == nil && have

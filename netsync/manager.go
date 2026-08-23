@@ -1052,8 +1052,11 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	case wire.InvTypeWitnessBlock:
 		fallthrough
 	case wire.InvTypeBlock:
-		// Ask chain if the block is known to it in any form (main
-		// chain, side chain, or orphan).
+		// Already queued for IBD validate, or known to the chain in
+		// any form (main chain, side chain, or orphan).
+		if sm.hasPendingValidate(invVect.Hash) {
+			return true, nil
+		}
 		return sm.chain.HaveBlock(&invVect.Hash)
 
 	case wire.InvTypeWitnessTx:

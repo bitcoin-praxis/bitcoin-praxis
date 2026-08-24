@@ -30,6 +30,11 @@ const (
 	// not be performed.
 	BFNoPoWCheck
 
+	// BFNoScriptCheck may be set to skip transaction script verification
+	// because scripts were already verified via SoftConnectNext +
+	// VerifyBlockScripts (parallel IBD validation pipeline).
+	BFNoScriptCheck
+
 	// BFNone is a convenience value to specifically indicate no flags.
 	BFNone BehaviorFlags = 0
 )

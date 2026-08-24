@@ -17,9 +17,12 @@ gate: `blockchain/fullblocktests` must pass with identical outcomes.
   `--witness-buffer` (default 2016), witness is excised and the stripped block
   is zstd-compressed. Measured **52.5%** smaller on a 1005 GB mainnet chain
   (~477 GB). Distinct from `--prune`, which deletes whole blocks.
-- **Roadmap:** parallel IBD validation (M2), in-process wallet +
-  **Bitcoin-Praxis Wallet** GUI (M3), cross-platform async I/O (M4), DATUM /
-  Stratum v2 mining (M5). See [docs/ROADMAP.md](docs/ROADMAP.md).
+- **3× faster IBD (M2, shipped):** nocheckpoints full-validation vs stock
+  btcd v0.26.0 (~12 days → ~4 days to 961k) with default compression.
+  Keep witness (`--witness-buffer=0`) and the same opts are **~4×**.
+- **Roadmap:** in-process wallet + **Bitcoin-Praxis Wallet** GUI (M3),
+  cross-platform async I/O (M4), DATUM / Stratum v2 mining (M5). See
+  [docs/ROADMAP.md](docs/ROADMAP.md).
 
 The Go module path is still `github.com/btcsuite/btcd` for now; user-facing
 names are Bitcoin-Praxis / `praxisd`.
@@ -64,6 +67,7 @@ $ ./praxisd --prune=1536            # Core-style prune; forces witness-buffer of
 |-----|----------|
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Milestones M1–M5 |
 | [docs/M1_TEST_PLAN.md](docs/M1_TEST_PLAN.md) | M1 test matrix + **tests we ran** |
+| [docs/M2_TEST_PLAN.md](docs/M2_TEST_PLAN.md) | M2 IBD A/B vs stock (3×) |
 | [docs/configuration.md](docs/configuration.md) | Config / listen options |
 | [docs/](docs/) | Full docs hub |
 

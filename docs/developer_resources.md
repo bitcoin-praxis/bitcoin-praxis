@@ -3,6 +3,7 @@
 * [Code Contribution Guidelines](code_contribution_guidelines.md)
 * [Roadmap](ROADMAP.md)
 * [M1 test plan](M1_TEST_PLAN.md)
+* [M2 test plan](M2_TEST_PLAN.md)
 
 * [JSON-RPC Reference](json_rpc_api.md)
   * [RPC Examples](json_rpc_api.md#ExampleCode)

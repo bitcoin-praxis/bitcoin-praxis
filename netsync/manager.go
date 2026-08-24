@@ -14,7 +14,6 @@ import (
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chaincfg/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
-	"github.com/btcsuite/btcd/database"
 	"github.com/btcsuite/btcd/mempool"
 	peerpkg "github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/wire/v2"
@@ -23,8 +22,9 @@ import (
 const (
 	// minInFlightBlocks is the minimum number of blocks that should be
 	// in the request queue for the initial block download mode before
-	// requesting more.
-	minInFlightBlocks = 10
+	// requesting more. Sized to keep download ahead of the parallel
+	// validation window on multi-core hosts.
+	minInFlightBlocks = 16
 
 	// maxRejectedTxns is the maximum number of rejected transactions
 	// hashes to store in memory.
@@ -154,10 +154,6 @@ type peerSyncState struct {
 	requestedTxns   map[chainhash.Hash]struct{}
 	requestedBlocks map[chainhash.Hash]struct{}
 
-	// bytesFetched counts IBD block bytes delivered in the current
-	// parallel-fetch scoring window.
-	bytesFetched uint64
-
 	// blocksDelivered is the total IBD blocks this peer successfully
 	// contributed (connected, non-orphan). Used to prefer working peers.
 	blocksDelivered uint64
@@ -224,11 +220,18 @@ type SyncManager struct {
 	// orphan/lookahead buffer stays tight around tip+1.
 	priorityBlocks map[chainhash.Hash]struct{}
 
-	// lastScoreTime is the last parallel-fetch slow-peer ranking pass.
-	lastScoreTime time.Time
+	// pendingValidate holds IBD blocks waiting for the ordered parallel
+	// soft-connect / script-verify / commit pipeline.
+	pendingValidate map[chainhash.Hash]*pendingIBDBlock
 
 	// The following fields are used for the initial block download mode.
 	ibdMode bool
+
+	// recentDelivered records hashes of IBD blocks we have already accepted
+	// as the race winner, so late copies from losing peers can be dropped
+	// cheaply in QueueBlock before they occupy the single-threaded
+	// blockHandler. Read from peer goroutines, written from blockHandler.
+	recentDelivered sync.Map
 
 	// An optional fee estimator.
 	feeEstimator *mempool.FeeEstimator
@@ -735,9 +738,16 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 		return
 	}
 
-	// If we didn't ask for this block then the peer is misbehaving.
+	// If we didn't ask for this block then the peer is misbehaving —
+	// unless this is a race-to-first loser (another peer already delivered
+	// the same hash). Drop late race copies without disconnecting.
 	blockHash := bmsg.block.Hash()
 	if _, exists = state.requestedBlocks[*blockHash]; !exists {
+		if sm.isLateRaceBlock(blockHash) {
+			log.Debugf("Ignoring late race block %v from %s",
+				blockHash, peer.Addr())
+			return
+		}
 		// The regression test intentionally sends some blocks twice
 		// to test duplicate block insertion fails.  Don't disconnect
 		// the peer or ignore the block when we're in regression test
@@ -756,150 +766,24 @@ func (sm *SyncManager) handleBlockMsg(bmsg *blockMsg) {
 	// next checkpoint.
 	isCheckpointBlock, behaviorFlags := sm.checkHeadersList(blockHash)
 
-	// Remove block from request maps. Either chain will know about it and
-	// so we shouldn't have any more instances of trying to fetch it, or we
-	// will fail the insert and thus we'll retry next time we get an inv.
-	delete(state.requestedBlocks, *blockHash)
-	delete(sm.requestedBlocks, *blockHash)
+	// Clear this hash from every peer (race winner). Late copies from other
+	// racers then look unsolicited and are dropped via isLateRaceBlock.
+	sm.clearAllBlockRequests(*blockHash)
 
-	// Process the block to include validation, best chain selection, orphan
-	// handling, etc.
-	_, isOrphan, err := sm.chain.ProcessBlock(bmsg.block, behaviorFlags)
-	if err != nil {
-		// When the error is a rule error, it means the block was simply
-		// rejected as opposed to something actually going wrong, so log
-		// it as such.  Otherwise, something really did go wrong, so log
-		// it as an actual error.
-		if _, ok := err.(blockchain.RuleError); ok {
-			log.Infof("Rejected block %v from %s: %v", blockHash,
-				peer, err)
-		} else {
-			log.Errorf("Failed to process block %v: %v",
-				blockHash, err)
-		}
-		if dbErr, ok := err.(database.Error); ok && dbErr.ErrorCode ==
-			database.ErrCorruption {
-			panic(dbErr)
-		}
+	// Record the winner so late copies still in flight on losing peers can be
+	// dropped cheaply in QueueBlock before they occupy the blockHandler.
+	sm.markDelivered(*blockHash)
 
-		// Convert the error into an appropriate reject message and
-		// send it.
-		code, reason := mempool.ErrToRejectErr(err)
-		peer.PushRejectMsg(wire.CmdBlock, code, reason, blockHash, false)
+	// During IBD without BFFastAdd, enqueue every body so out-of-order
+	// arrivals (light then heavy, or the reverse) still drain. The sig
+	// heuristic only chooses serial vs pipelined verify inside the flush.
+	if shouldEnqueueIBD(sm.ibdMode, behaviorFlags) {
+		sm.enqueueParallelBlock(bmsg, behaviorFlags)
+		sm.flushParallelValidate()
 		return
 	}
 
-	// Meta-data about the new block this peer is reporting. We use this
-	// below to update this peer's latest block height and the heights of
-	// other peers based on their last announced block hash. This allows us
-	// to dynamically update the block heights of peers, avoiding stale
-	// heights when looking for a new sync peer. Upon acceptance of a block
-	// or recognition of an orphan, we also use this information to update
-	// the block heights over other peers who's invs may have been ignored
-	// if we are actively syncing while the chain is not yet current or
-	// who may have lost the lock announcement race.
-	var heightUpdate int32
-	var blkHashUpdate *chainhash.Hash
-
-	// Request the parents for the orphan block from the peer that sent it.
-	if isOrphan {
-		// We've just received an orphan block from a peer. In order
-		// to update the height of the peer, we try to extract the
-		// block height from the scriptSig of the coinbase transaction.
-		// Extraction is only attempted if the block's version is
-		// high enough (ver 2+).
-		header := &bmsg.block.MsgBlock().Header
-		if blockchain.ShouldHaveSerializedBlockHeight(header) {
-			coinbaseTx := bmsg.block.Transactions()[0]
-			cbHeight, err := blockchain.ExtractCoinbaseHeight(coinbaseTx)
-			if err != nil {
-				log.Warnf("Unable to extract height from "+
-					"coinbase tx: %v", err)
-			} else {
-				log.Debugf("Extracted height of %v from "+
-					"orphan block", cbHeight)
-				heightUpdate = cbHeight
-				blkHashUpdate = blockHash
-			}
-		}
-
-		orphanRoot := sm.chain.GetOrphanRoot(blockHash)
-		locator, err := sm.chain.LatestBlockLocator()
-		if err != nil {
-			log.Warnf("Failed to get block locator for the "+
-				"latest block: %v", err)
-		} else {
-			peer.PushGetBlocksMsg(locator, orphanRoot)
-		}
-	} else {
-		// Any parallel IBD download peer counts as progress.
-		if sm.isBlockDownloadPeer(peer) || peer == sm.syncPeer {
-			sm.noteBlockPeerProgress(peer, bmsg.block.MsgBlock().SerializeSize())
-		}
-
-		// When the block is not an orphan, log information about it and
-		// update the chain state.
-		sm.progressLogger.LogBlockHeight(bmsg.block, sm.chain)
-
-		// Update this peer's latest block height, for future
-		// potential sync node candidacy.
-		best := sm.chain.BestSnapshot()
-		heightUpdate = best.Height
-		blkHashUpdate = &best.Hash
-
-		// Clear the rejected transactions.
-		sm.rejectedTxns = make(map[chainhash.Hash]struct{})
-	}
-
-	// Update the block height for this peer. But only send a message to
-	// the server for updating peer heights if this is an orphan or our
-	// chain is "current". This avoids sending a spammy amount of messages
-	// if we're syncing the chain from scratch.
-	if blkHashUpdate != nil && heightUpdate != 0 {
-		peer.UpdateLastBlockHeight(heightUpdate)
-		if isOrphan || sm.current() {
-			go sm.peerNotifier.UpdatePeerHeights(blkHashUpdate, heightUpdate,
-				peer)
-		}
-	}
-
-	// If we are not in the initial block download mode, it's a good time to
-	// periodically flush the blockchain cache because we don't expect new
-	// blocks immediately.  After that, there is nothing more to do.
-	if !sm.ibdMode {
-		if err := sm.chain.FlushUtxoCache(blockchain.FlushPeriodic); err != nil {
-			log.Errorf("Error while flushing the blockchain cache: %v", err)
-		}
-		return
-	}
-
-	// If we're on a checkpointed block, check if we still have checkpoints
-	// to let the user know if we're switching to normal mode.
-	if isCheckpointBlock {
-		log.Infof("Continuing IBD, on checkpoint block %v(%v)",
-			bmsg.block.Hash(), bmsg.block.Height())
-		nextCheckpoint := sm.findNextHeaderCheckpoint(bmsg.block.Height())
-		if nextCheckpoint == nil {
-			log.Infof("Reached the final checkpoint -- " +
-				"switching to normal mode")
-		}
-	}
-
-	// Fetch more blocks if we're still not caught up to the best header.
-	// Refill the whole parallel pool (least-loaded assignment).
-	_, lastHeight := sm.chain.BestHeader()
-	if bmsg.block.Height() < lastHeight {
-		sm.fillAllBlockRequests()
-		return
-	}
-
-	if bmsg.block.Height() >= lastHeight {
-		log.Infof("Finished the initial block download and "+
-			"caught up to block %v(%v) -- now listening to blocks.",
-			bmsg.block.Hash(), bmsg.block.Height())
-		sm.ibdMode = false
-		sm.blockPeers = make(map[*peerpkg.Peer]struct{})
-	}
+	sm.processBlockSerial(bmsg, behaviorFlags, isCheckpointBlock)
 }
 
 // fetchHeaderBlocks creates and sends a request to the given peer for the next
@@ -939,8 +823,18 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer, maxNew int) *wire.M
 		if len(peerState.requestedBlocks) >= maxInFlightPerPeer {
 			break
 		}
-		if _, inflight := sm.requestedBlocks[hash]; inflight {
-			delete(sm.priorityBlocks, hash)
+		height, herr := sm.chain.HeaderHeightByHash(hash)
+		if herr != nil {
+			height = 0
+		}
+		if !sm.mayRequestBlock(peer, hash, height) {
+			// Already in this peer's in-flight, or not a race-eligible
+			// tip-ahead height — leave the priority entry for another
+			// racer, or drop if the chain already has it.
+			if _, inflight := sm.requestedBlocks[hash]; inflight &&
+				!sm.raceEligibleHeight(height) {
+				delete(sm.priorityBlocks, hash)
+			}
 			continue
 		}
 
@@ -951,13 +845,12 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer, maxNew int) *wire.M
 				"existing inventory during priority block "+
 				"fetch: %v", err)
 		}
-		delete(sm.priorityBlocks, hash)
 		if haveInv {
+			delete(sm.priorityBlocks, hash)
 			continue
 		}
 
-		sm.requestedBlocks[hash] = struct{}{}
-		peerState.requestedBlocks[hash] = struct{}{}
+		sm.markBlockRequested(peer, hash)
 		if peer.IsWitnessEnabled() {
 			iv.Type = wire.InvTypeWitnessBlock
 		}
@@ -992,13 +885,10 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer, maxNew int) *wire.M
 				"fetch: %v", err)
 		}
 		if !haveInv {
-			// Skip blocks that are already in-flight to avoid
-			// sending duplicate getdata requests. Duplicates
-			// cause the peer to send the block twice; the second
-			// copy arrives after the first has been processed and
-			// removed from requestedBlocks, triggering an
-			// "unrequested block" disconnect.
-			if _, exists := sm.requestedBlocks[*hash]; exists {
+			// Every tip-ahead height races across all willing pool peers
+			// (see mayRequestBlock / raceEligibleHeight); late copies are
+			// dropped via isLateRaceBlock.
+			if !sm.mayRequestBlock(peer, *hash, h) {
 				continue
 			}
 
@@ -1008,9 +898,7 @@ func (sm *SyncManager) buildBlockRequest(peer *peerpkg.Peer, maxNew int) *wire.M
 				break
 			}
 
-			sm.requestedBlocks[*hash] = struct{}{}
-			peerState.requestedBlocks[*hash] = struct{}{}
-			delete(sm.priorityBlocks, *hash)
+			sm.markBlockRequested(peer, *hash)
 
 			// If we're fetching from a witness enabled peer
 			// post-fork, then ensure that we receive all the
@@ -1111,17 +999,17 @@ func (sm *SyncManager) handleNotFoundMsg(nfmsg *notFoundMsg) {
 			fallthrough
 		case wire.InvTypeBlock:
 			if _, exists := state.requestedBlocks[inv.Hash]; exists {
-				delete(state.requestedBlocks, inv.Hash)
-				delete(sm.requestedBlocks, inv.Hash)
+				sm.unmarkPeerBlockRequest(state, inv.Hash)
+				state.notFoundBlocks++
 				// Immediately put tip-needed work back at the front of
-				// the line; otherwise IBD stalls until a stall timeout.
-				if sm.ibdMode {
+				// the line when no other racer still holds it;
+				// otherwise IBD stalls until a stall timeout.
+				if sm.ibdMode && sm.peersRequestingBlock(inv.Hash) == 0 {
 					if sm.priorityBlocks == nil {
 						sm.priorityBlocks = make(map[chainhash.Hash]struct{})
 					}
 					sm.priorityBlocks[inv.Hash] = struct{}{}
 					requeued++
-					state.notFoundBlocks++
 				}
 			}
 
@@ -1164,8 +1052,11 @@ func (sm *SyncManager) haveInventory(invVect *wire.InvVect) (bool, error) {
 	case wire.InvTypeWitnessBlock:
 		fallthrough
 	case wire.InvTypeBlock:
-		// Ask chain if the block is known to it in any form (main
-		// chain, side chain, or orphan).
+		// Already queued for IBD validate, or known to the chain in
+		// any form (main chain, side chain, or orphan).
+		if sm.hasPendingValidate(invVect.Hash) {
+			return true, nil
+		}
 		return sm.chain.HaveBlock(&invVect.Hash)
 
 	case wire.InvTypeWitnessTx:
@@ -1413,6 +1304,8 @@ func (sm *SyncManager) handleInvMsg(imsg *invMsg) {
 func (sm *SyncManager) blockHandler() {
 	stallTicker := time.NewTicker(stallSampleInterval)
 	defer stallTicker.Stop()
+	fetchDiagTicker := time.NewTicker(5 * time.Second)
+	defer fetchDiagTicker.Stop()
 
 out:
 	for {
@@ -1478,6 +1371,10 @@ out:
 
 		case <-stallTicker.C:
 			sm.handleStallSample()
+
+		case <-fetchDiagTicker.C:
+			sm.sweepRecentDelivered()
+			sm.logFetchDiagnostic()
 
 		case <-sm.quit:
 			break out
@@ -1620,6 +1517,20 @@ func (sm *SyncManager) QueueBlock(block *btcutil.Block, peer *peerpkg.Peer, done
 	if atomic.LoadInt32(&sm.shutdown) != 0 {
 		done <- struct{}{}
 		return
+	}
+
+	// Fast-drop late race-to-first copies before they hit the single-threaded
+	// blockHandler. Under full racing every pool peer requests the same
+	// tip-ahead heights; the winner is recorded in recentDelivered when it is
+	// accepted, so the losers' copies (arriving ~1 RTT later) are dropped here
+	// instead of being deserialized-into-a-blockMsg, queued, and processed by
+	// the blockHandler. Without this, 3× blockMsg per height saturate the
+	// blockHandler in the light range and IBD runs ~2× slower than serial.
+	if sm.ibdMode {
+		if _, late := sm.recentDelivered.Load(*block.Hash()); late {
+			done <- struct{}{}
+			return
+		}
 	}
 
 	sm.msgChan <- &blockMsg{block: block, peer: peer, reply: done}

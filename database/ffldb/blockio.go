@@ -288,6 +288,7 @@ func (s *blockStore) openWriteFile(fileNum uint32) (filer, error) {
 		str := fmt.Sprintf("failed to open file %q: %v", filePath, err)
 		return nil, makeDbErr(database.ErrDriverSpecific, str, err)
 	}
+	adviseSequential(file)
 
 	return file, nil
 }
@@ -314,6 +315,7 @@ func (s *blockStore) openFile(fileNum uint32) (*lockableFile, error) {
 		return nil, makeDbErr(database.ErrDriverSpecific, err.Error(),
 			err)
 	}
+	adviseSequential(file)
 	blockFile := &lockableFile{file: file}
 
 	// Detect the file format for cold files by reading the per-file header.

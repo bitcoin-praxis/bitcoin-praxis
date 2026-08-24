@@ -482,6 +482,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
+	cache.afterFlushCommit()
 	if cache.cachedEntries.length() != 0 {
 		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
 	}
@@ -545,6 +546,7 @@ func TestUtxoCacheFlush(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
+	cache.afterFlushCommit()
 	if cache.cachedEntries.length() != 0 {
 		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
 	}
@@ -590,15 +592,28 @@ func TestUtxoCacheFlush(t *testing.T) {
 	// Arbitrarily set the last flush time to 6 minutes ago.
 	cache.lastFlushTime = time.Now().Add(-time.Minute * 6)
 
-	// Attempt to flush with flush periodic.  Should flush now.
+	// Attempt to flush with flush periodic.  Should flush now but keep the
+	// unspent working set in memory.
 	err = chain.db.Update(func(dbTx database.Tx) error {
 		return cache.flush(dbTx, FlushPeriodic, chain.stateSnapshot)
 	})
 	if err != nil {
 		t.Fatalf("unexpected error while flushing cache: %v", err)
 	}
-	if cache.cachedEntries.length() != 0 {
-		t.Fatalf("Expected 0 entries, has %d instead", cache.cachedEntries.length())
+	cache.afterFlushCommit()
+	if cache.cachedEntries.length() != len(outPoints1) {
+		t.Fatalf("Expected %d kept entries after periodic flush, has %d instead",
+			len(outPoints1), cache.cachedEntries.length())
+	}
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry == nil {
+				t.Fatal("kept nil entry after periodic flush")
+			}
+			if entry.isFresh() || entry.isModified() {
+				t.Fatal("kept entry should be clean after periodic flush")
+			}
+		}
 	}
 
 	err = assertConsistencyState(chain, tip.Hash())
@@ -959,5 +974,199 @@ func TestInitConsistentState(t *testing.T) {
 	if chain.BestSnapshot().Height != blocks[len(blocks)-1].Height() {
 		t.Fatalf("expected the chain to sync up to height %d",
 			blocks[len(blocks)-1].Height())
+	}
+}
+
+func TestUtxoCacheKeepHotEvictsWhenFull(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestUtxoCacheKeepHotEvictsWhenFull")
+	defer tearDown()
+	cache := chain.utxoCache
+	cache.maxTotalMemoryUsage = 4 * 1024
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	const n = 80
+	for i := 0; i < n; i++ {
+		op := outpointFromInt(i)
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		if err := cache.addTxOut(op, &txOut, true, int32(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cache.totalMemoryUsage() < cache.maxTotalMemoryUsage {
+		t.Fatalf("test setup: cache %d did not exceed max %d",
+			cache.totalMemoryUsage(), cache.maxTotalMemoryUsage)
+	}
+	before := cache.cachedEntries.length()
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.writeCache(dbTx, chain.stateSnapshot, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.afterFlushCommit()
+
+	kept := cache.cachedEntries.length()
+	if kept == 0 {
+		t.Fatal("expected keep-hot flush to retain unspent entries")
+	}
+	if kept >= before {
+		t.Fatalf("expected eviction, kept %d of %d", kept, before)
+	}
+	if cache.totalEntryMemory > cache.maxTotalMemoryUsage/utxoCacheKeepFraction {
+		t.Fatalf("entry memory %d still over keep budget %d",
+			cache.totalEntryMemory, cache.maxTotalMemoryUsage/utxoCacheKeepFraction)
+	}
+	if cache.cachedEntries.length() > budgetedMapEntries(cache.maxTotalMemoryUsage) {
+		t.Fatalf("kept %d entries, budgeted map cap %d",
+			cache.cachedEntries.length(), budgetedMapEntries(cache.maxTotalMemoryUsage))
+	}
+	if cache.totalMemoryUsage() > cache.maxTotalMemoryUsage {
+		t.Fatalf("after keep-hot, total %d exceeds max %d",
+			cache.totalMemoryUsage(), cache.maxTotalMemoryUsage)
+	}
+	if len(cache.cachedEntries.maps) != 1 {
+		t.Fatalf("expected 1 map after compact, got %d", len(cache.cachedEntries.maps))
+	}
+	wantCap := budgetedMapEntries(cache.maxTotalMemoryUsage)
+	if cache.cachedEntries.maxEntries[0] != wantCap {
+		t.Fatalf("maxEntries %d, want budgeted %d", cache.cachedEntries.maxEntries[0], wantCap)
+	}
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range cache.cachedEntries.maps {
+		for _, entry := range m {
+			if entry == nil {
+				continue
+			}
+			if entry.isFresh() || entry.isModified() {
+				t.Fatal("kept entry should be clean")
+			}
+		}
+	}
+}
+
+func TestKeepHotFlushDefersMemoryUntilCommit(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestKeepHotFlushDefersMemoryUntilCommit")
+	defer tearDown()
+	cache := chain.utxoCache
+
+	op := outpointFromInt(1)
+	txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+	if err := cache.addTxOut(op, &txOut, true, 1); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := cache.cachedEntries.get(op)
+	if !ok || entry == nil || !entry.isModified() {
+		t.Fatal("setup: expected dirty cache entry")
+	}
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.writeCache(dbTx, chain.stateSnapshot, true)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, ok = cache.cachedEntries.get(op)
+	if !ok || entry == nil {
+		t.Fatal("entry dropped inside the txn before commit apply")
+	}
+	if !entry.isModified() {
+		t.Fatal("dirty bit cleared inside the txn; a rollback would skip replay")
+	}
+
+	cache.afterFlushCommit()
+	entry, ok = cache.cachedEntries.get(op)
+	if !ok || entry == nil {
+		t.Fatal("keep-hot should retain the unspent entry after commit")
+	}
+	if entry.isModified() || entry.isFresh() {
+		t.Fatal("kept entry should be clean after commit apply")
+	}
+}
+
+func TestMapSliceCompactUsesBudgetedCap(t *testing.T) {
+	const maxMem = 64 * 1024
+	wantCap := budgetedMapEntries(maxMem)
+	ms := mapSlice{
+		maps:                []map[wire.OutPoint]*UtxoEntry{make(map[wire.OutPoint]*UtxoEntry)},
+		maxEntries:          []int{wantCap * 4},
+		maxTotalMemoryUsage: maxMem,
+	}
+	const n = 40
+	for i := 0; i < n; i++ {
+		op := outpointFromInt(i)
+		ms.maps[0][op] = NewUtxoEntry(
+			&wire.TxOut{Value: 1, PkScript: getValidP2PKHScript()}, 1, false)
+	}
+
+	ms.compact()
+
+	if len(ms.maps) != 1 {
+		t.Fatalf("maps %d, want 1", len(ms.maps))
+	}
+	if ms.maxEntries[0] != wantCap {
+		t.Fatalf("maxEntries %d, want budgeted %d (not 2× remaining=%d)",
+			ms.maxEntries[0], wantCap, n*2)
+	}
+	if got := ms.length(); got != n {
+		t.Fatalf("length %d, want %d", got, n)
+	}
+	if uint64(ms.size()) > maxMem {
+		t.Fatalf("map size %d exceeds budget %d", ms.size(), maxMem)
+	}
+}
+
+func TestFlushIfNeededWritesDirtyBeforeCap(t *testing.T) {
+	chain, _, tearDown := utxoCacheTestChain("TestFlushIfNeededWritesDirtyBeforeCap")
+	defer tearDown()
+	cache := chain.utxoCache
+	cache.maxTotalMemoryUsage = 64 * 1024
+	cache.cachedEntries.maxTotalMemoryUsage = cache.maxTotalMemoryUsage
+
+	var n int
+	for cache.dirtyEntryMemory() < cache.dirtyFlushLimit() {
+		op := outpointFromInt(n)
+		txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+		if err := cache.addTxOut(op, &txOut, true, int32(n)); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if cache.totalMemoryUsage() >= cache.maxTotalMemoryUsage {
+			t.Fatal("test setup hit the cap before the dirty flush limit")
+		}
+	}
+	if cache.totalMemoryUsage() >= cache.maxTotalMemoryUsage {
+		t.Fatal("dirty flush must fire below the cap")
+	}
+
+	cache.lastFlushHash[0] ^= 0xff
+
+	err := chain.db.Update(func(dbTx database.Tx) error {
+		return cache.flush(dbTx, FlushIfNeeded, chain.stateSnapshot)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.afterFlushCommit()
+
+	if err := assertNbEntriesOnDisk(chain, n); err != nil {
+		t.Fatal(err)
+	}
+	if cache.dirtyEntryMemory() != 0 {
+		t.Fatalf("dirty %d after keep-hot flush", cache.dirtyEntryMemory())
+	}
+	if cache.keptEntryMemory == 0 {
+		t.Fatal("keptEntryMemory should be set after keep-hot")
+	}
+
+	op := outpointFromInt(n)
+	txOut := wire.TxOut{Value: 10000, PkScript: getValidP2PKHScript()}
+	if err := cache.addTxOut(op, &txOut, true, int32(n)); err != nil {
+		t.Fatal(err)
+	}
+	if cache.dirtyNeedsFlush(FlushIfNeeded) {
+		t.Fatal("one extra entry must not retrigger a 512MiB-scale dirty flush")
 	}
 }

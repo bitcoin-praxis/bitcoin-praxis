@@ -11,6 +11,7 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/btcsuite/btcd/chainhash/v2"
+	"github.com/btcsuite/btcd/txscript/v2/secp256k1verify"
 	"github.com/btcsuite/btcd/wire/v2"
 )
 
@@ -141,12 +142,12 @@ func (b *baseSigVerifier) verifySig(sigHash []byte) bool {
 		copy(sigHashBytes[:], sigHash[:])
 
 		valid = b.vm.sigCache.Exists(sigHashBytes, b.sigBytes, b.pkBytes)
-		if !valid && b.sig.Verify(sigHash, b.pubKey) {
+		if !valid && secp256k1verify.VerifyECDSA(b.sig, sigHash, b.pubKey) {
 			b.vm.sigCache.Add(sigHashBytes, b.sigBytes, b.pkBytes)
 			valid = true
 		}
 	} else {
-		valid = b.sig.Verify(sigHash, b.pubKey)
+		valid = secp256k1verify.VerifyECDSA(b.sig, sigHash, b.pubKey)
 	}
 
 	return valid
@@ -352,7 +353,7 @@ func (t *taprootSigVerifier) verifySig(sigHash []byte) bool {
 	// If we didn't find the entry in the cache, then we'll perform full
 	// verification as normal, adding the entry to the cache if it's found
 	// to be valid.
-	sigValid := t.sig.Verify(sigHash, t.pubKey)
+	sigValid := secp256k1verify.VerifySchnorr(t.sig, sigHash, t.pubKey)
 	if sigValid {
 		if t.sigCache != nil {
 			// The sig is valid, so we'll add it to the cache.

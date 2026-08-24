@@ -7,7 +7,6 @@ package blockchain
 import (
 	"fmt"
 	"math"
-	"runtime"
 	"time"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
@@ -123,12 +122,9 @@ func (v *txValidator) Validate(items []*txValidateItem) error {
 	}
 
 	// Limit the number of goroutines to do script validation based on the
-	// number of processor cores.  This helps ensure the system stays
-	// reasonably responsive under heavy load.
-	maxGoRoutines := runtime.NumCPU() * 3
-	if maxGoRoutines <= 0 {
-		maxGoRoutines = 1
-	}
+	// configured worker budget (default NumCPU*3). Parallel IBD may set this
+	// to the full serial budget per concurrent block; GOMAXPROCS bounds cores.
+	maxGoRoutines := ScriptCheckWorkers()
 	if maxGoRoutines > len(items) {
 		maxGoRoutines = len(items)
 	}

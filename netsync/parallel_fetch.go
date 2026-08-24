@@ -5,11 +5,14 @@
 package netsync
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/btcsuite/btcd/chainhash/v2"
 	peerpkg "github.com/btcsuite/btcd/peer"
+	"github.com/btcsuite/btcd/wire/v2"
 )
 
 const (
@@ -20,10 +23,6 @@ const (
 	// maxInFlightPerPeer caps outstanding getdata block hashes per peer so
 	// work stays partitioned across the parallel pool.
 	maxInFlightPerPeer = 64
-
-	// slowPeerRatio kicks a peer whose score-window throughput is below
-	// this fraction of the pool median (when at least two peers have data).
-	slowPeerRatio = 0.25
 )
 
 // startParallelBlockFetch selects up to maxParallelBlockPeers download peers
@@ -38,7 +37,6 @@ func (sm *SyncManager) startParallelBlockFetch() {
 
 	sm.ibdMode = true
 	sm.lastProgressTime = time.Now()
-	sm.lastScoreTime = time.Now()
 
 	// Start with the header sync peer only. Unproven peers often claim
 	// NODE_NETWORK but cannot serve history; assigning tip+1/+2 to them
@@ -67,13 +65,16 @@ func (sm *SyncManager) startParallelBlockFetch() {
 }
 
 // ensureBlockPeers grows the download pool up to maxParallelBlockPeers from
-// sync candidates that advertise blocks we still need.
+// sync candidates that advertise blocks we still need. Newly added peers are
+// probed immediately so they can earn blocksDelivered (fill previously
+// skipped undelivered peers entirely, leaving them idle).
 func (sm *SyncManager) ensureBlockPeers() {
 	if sm.blockPeers == nil {
 		sm.blockPeers = make(map[*peerpkg.Peer]struct{})
 	}
 
 	bestHeight := sm.chain.BestSnapshot().Height
+	var added []*peerpkg.Peer
 
 	// Prefer the current sync peer first (often the peer that just finished
 	// headers quickly) so it is not left out of a randomly ordered map walk.
@@ -84,6 +85,7 @@ func (sm *SyncManager) ensureBlockPeers() {
 			if _, exists := sm.blockPeers[sm.syncPeer]; !exists &&
 				len(sm.blockPeers) < maxParallelBlockPeers {
 				sm.addBlockPeer(sm.syncPeer)
+				added = append(added, sm.syncPeer)
 			}
 		}
 	}
@@ -103,11 +105,16 @@ func (sm *SyncManager) ensureBlockPeers() {
 		}
 
 		sm.addBlockPeer(peer)
+		added = append(added, peer)
+	}
+
+	for _, peer := range added {
+		sm.probeNewBlockPeer(peer)
 	}
 }
 
-// addBlockPeer registers peer for parallel IBD getdata and resets its score
-// window so a fresh join is not immediately treated as slow.
+// addBlockPeer registers peer for parallel IBD getdata and marks it as having
+// just progressed so a fresh join is not immediately treated as stalled.
 func (sm *SyncManager) addBlockPeer(peer *peerpkg.Peer) {
 	state, exists := sm.peerStates[peer]
 	if !exists {
@@ -115,7 +122,6 @@ func (sm *SyncManager) addBlockPeer(peer *peerpkg.Peer) {
 	}
 
 	sm.blockPeers[peer] = struct{}{}
-	state.bytesFetched = 0
 	state.lastBlockProgress = time.Now()
 	log.Infof("IBD block peer +%s (%d/%d)",
 		peer.Addr(), len(sm.blockPeers), maxParallelBlockPeers)
@@ -186,8 +192,17 @@ func (sm *SyncManager) blockPeersByLoad() []*peerpkg.Peer {
 	return peers
 }
 
-// fillAllBlockRequests assigns more getdata work to under-filled block peers
-// in small round-robin chunks so the pool stays partitioned.
+// fillAllBlockRequests assigns more getdata work to under-filled block peers.
+//
+// Under full race-to-first every pool peer requests the same tip-ahead
+// heights (first delivery wins, late copies dropped), so each peer is filled
+// in bulk: one getdata of up to maxInFlightPerPeer hashes per peer. Chunked
+// interleaving was for the removed exclusive-partition scheme; under racing it
+// only fragmented the request into 64 single-hash getdata messages per peer,
+// and on the light range (tiny blocks) that getdata overhead dominated and ran
+// ~2× slower than serial. Unproven peers participate immediately (no
+// workingOnly skip): a non-serving newcomer is removed by the hard-stall kick,
+// not by starving it of work.
 func (sm *SyncManager) fillAllBlockRequests() {
 	if len(sm.blockPeers) == 0 {
 		return
@@ -199,18 +214,6 @@ func (sm *SyncManager) fillAllBlockRequests() {
 		return
 	}
 
-	// Small chunks keep heights interleaved across peers. Large consecutive
-	// ranges stall IBD on whichever peer holds tip+1 while later blocks sit
-	// as orphans.
-	const assignChunk = 1
-	workingOnly := false
-	for peer := range sm.blockPeers {
-		if state := sm.peerStates[peer]; state != nil && state.blocksDelivered > 0 {
-			workingOnly = true
-			break
-		}
-	}
-
 	for {
 		assignedAny := false
 		for _, peer := range sm.blockPeersByLoad() {
@@ -218,15 +221,9 @@ func (sm *SyncManager) fillAllBlockRequests() {
 			if state == nil {
 				continue
 			}
-			if workingOnly && state.blocksDelivered == 0 {
-				continue
-			}
 			room := maxInFlightPerPeer - len(state.requestedBlocks)
 			if room <= 0 {
 				continue
-			}
-			if room > assignChunk {
-				room = assignChunk
 			}
 			if sm.fetchHeaderBlocksLimited(peer, room) > 0 {
 				assignedAny = true
@@ -265,13 +262,12 @@ func (sm *SyncManager) isBlockDownloadPeer(peer *peerpkg.Peer) bool {
 }
 
 // noteBlockPeerProgress records that peer delivered a connected IBD block.
-func (sm *SyncManager) noteBlockPeerProgress(peer *peerpkg.Peer, blockBytes int) {
+func (sm *SyncManager) noteBlockPeerProgress(peer *peerpkg.Peer) {
 	state, exists := sm.peerStates[peer]
 	if !exists {
 		return
 	}
 
-	state.bytesFetched += uint64(blockBytes)
 	state.blocksDelivered++
 	state.lastBlockProgress = time.Now()
 	sm.lastProgressTime = time.Now()
@@ -281,9 +277,9 @@ func (sm *SyncManager) noteBlockPeerProgress(peer *peerpkg.Peer, blockBytes int)
 }
 
 // maybeGrowBlockPeerPool adds one unproven candidate when we have a working
-// peer and spare pool capacity. Newcomers only receive work while
-// workingOnly is false for them — once any peer has delivered, fillAll
-// skips undelivered peers, so growth uses probeAssignment instead.
+// peer and spare pool capacity. Newcomers race tip-ahead heights immediately
+// (fillAll does not skip undelivered peers); this just opens a pool slot so a
+// candidate can start racing without waiting for the next ensureBlockPeers.
 func (sm *SyncManager) maybeGrowBlockPeerPool() {
 	if len(sm.blockPeers) >= maxParallelBlockPeers {
 		return
@@ -328,18 +324,149 @@ func (sm *SyncManager) probeNewBlockPeer(peer *peerpkg.Peer) {
 	if state == nil {
 		return
 	}
-	// Temporarily allow assignment by marking as working for one request:
-	// fetchHeaderBlocksLimited respects per-peer caps only; workingOnly
-	// skips undelivered peers in fillAll, so call build directly here.
+	// Send one getdata immediately so a freshly added peer starts racing
+	// tip-ahead heights without waiting for the next fillAll cycle.
 	if sm.fetchHeaderBlocksLimited(peer, 1) > 0 {
 		log.Infof("IBD probe getdata → %s", peer.Addr())
 	}
 }
 
+// raceEligibleHeight reports whether height may be requested from more than
+// one IBD peer. Racing is the default fetch strategy: every tip-ahead height
+// is getdata'd from all willing pool peers and the first delivery wins; late
+// copies are dropped via isLateRaceBlock without disconnecting the loser.
+// Racing trades redundant WAN bandwidth for min-latency per block and makes
+// IBD robust to a single peer stalling — the product priority, not peer
+// fairness. Exclusive partitioning was removed: it multiplied aggregate
+// throughput only when no peer stalled, but a single trickling peer stranded
+// its exclusive range until a 3-minute hard-stall kick.
+func (sm *SyncManager) raceEligibleHeight(height int32) bool {
+	if !sm.ibdMode || height < 1 {
+		return false
+	}
+	tip := sm.chain.BestSnapshot().Height
+	return height > tip
+}
+
+// peersRequestingBlock counts peers that currently have hash in-flight.
+func (sm *SyncManager) peersRequestingBlock(hash chainhash.Hash) int {
+	n := 0
+	for _, state := range sm.peerStates {
+		if state == nil {
+			continue
+		}
+		if _, ok := state.requestedBlocks[hash]; ok {
+			n++
+		}
+	}
+	return n
+}
+
+// markBlockRequested records an outstanding getdata for hash from peer.
+func (sm *SyncManager) markBlockRequested(peer *peerpkg.Peer, hash chainhash.Hash) {
+	state := sm.peerStates[peer]
+	if state == nil {
+		return
+	}
+	state.requestedBlocks[hash] = struct{}{}
+	sm.requestedBlocks[hash] = struct{}{}
+	delete(sm.priorityBlocks, hash)
+}
+
+// clearAllBlockRequests drops hash from every peer's in-flight map and the
+// global set. Used when the race winner's block arrives so losers' late
+// copies are no longer "requested" by those peers.
+func (sm *SyncManager) clearAllBlockRequests(hash chainhash.Hash) {
+	for _, state := range sm.peerStates {
+		if state == nil {
+			continue
+		}
+		delete(state.requestedBlocks, hash)
+	}
+	delete(sm.requestedBlocks, hash)
+	delete(sm.priorityBlocks, hash)
+}
+
+// recentDeliveredTTL is how long a race-winner hash stays in recentDelivered.
+// Late copies arrive within ~1 WAN RTT of the winner; 60s covers even slow
+// peers with plenty of margin while bounding the map to a few thousand entries.
+const recentDeliveredTTL = 60 * time.Second
+
+// markDelivered records that an IBD block hash was accepted as the race winner,
+// so late copies from losing peers can be dropped cheaply in QueueBlock. Only
+// meaningful during IBD; called from the blockHandler thread.
+func (sm *SyncManager) markDelivered(hash chainhash.Hash) {
+	if !sm.ibdMode {
+		return
+	}
+	sm.recentDelivered.Store(hash, time.Now().Unix())
+}
+
+// sweepRecentDelivered evicts recentDelivered entries older than the TTL so
+// the map stays bounded across a long IBD. Called from the blockHandler tick.
+func (sm *SyncManager) sweepRecentDelivered() {
+	cutoff := time.Now().Add(-recentDeliveredTTL).Unix()
+	sm.recentDelivered.Range(func(k, v interface{}) bool {
+		if ts, ok := v.(int64); ok && ts < cutoff {
+			sm.recentDelivered.Delete(k)
+		}
+		return true
+	})
+}
+
+// unmarkPeerBlockRequest clears hash from one peer. If no other peer still
+// holds it, the global in-flight entry is removed too.
+func (sm *SyncManager) unmarkPeerBlockRequest(state *peerSyncState, hash chainhash.Hash) {
+	if state == nil {
+		return
+	}
+	delete(state.requestedBlocks, hash)
+	if sm.peersRequestingBlock(hash) == 0 {
+		delete(sm.requestedBlocks, hash)
+	}
+}
+
+// mayRequestBlock reports whether peer may send getdata for hash at height.
+//
+// A hash nobody currently holds in flight is always safe to request. A hash
+// already in flight on another peer is re-requested only when racing
+// tip-ahead (full race-to-first): the first delivery wins and late copies are
+// dropped via isLateRaceBlock without disconnecting the loser. Outside IBD
+// (serial sync) or for non-tip-ahead hashes (e.g. reorg blocks at or below the
+// current tip), duplicate getdata is suppressed so a single holder stays
+// responsible for the block.
+func (sm *SyncManager) mayRequestBlock(peer *peerpkg.Peer, hash chainhash.Hash, height int32) bool {
+	state := sm.peerStates[peer]
+	if state == nil {
+		return false
+	}
+	if _, already := state.requestedBlocks[hash]; already {
+		return false
+	}
+	if _, inflight := sm.requestedBlocks[hash]; !inflight {
+		return true
+	}
+	return sm.raceEligibleHeight(height)
+}
+
+// isLateRaceBlock reports that an unsolicited-looking block is a race loser
+// we should drop without disconnecting: we already hold it pending validate,
+// or the chain already knows it.
+func (sm *SyncManager) isLateRaceBlock(hash *chainhash.Hash) bool {
+	if hash == nil {
+		return false
+	}
+	if sm.hasPendingValidate(*hash) {
+		return true
+	}
+	have, err := sm.haveInventory(wire.NewInvVect(wire.InvTypeBlock, hash))
+	return err == nil && have
+}
+
 // requeuePeerBlockRequests returns a peer's outstanding IBD block hashes to
-// the front of the assign line: they are cleared from in-flight maps and
-// recorded in priorityBlocks so the next fill requests them before scanning
-// further ahead of tip (keeps the orphan buffer small).
+// the front of the assign line when no other peer is still racing them.
+// Hashes still in-flight on another racer are left alone (they will deliver
+// or notfound independently).
 func (sm *SyncManager) requeuePeerBlockRequests(state *peerSyncState) int {
 	if state == nil {
 		return 0
@@ -348,10 +475,15 @@ func (sm *SyncManager) requeuePeerBlockRequests(state *peerSyncState) int {
 		sm.priorityBlocks = make(map[chainhash.Hash]struct{})
 	}
 
-	n := len(state.requestedBlocks)
+	n := 0
 	for blockHash := range state.requestedBlocks {
+		delete(state.requestedBlocks, blockHash)
+		if sm.peersRequestingBlock(blockHash) > 0 {
+			continue // other racers still hold it
+		}
 		delete(sm.requestedBlocks, blockHash)
 		sm.priorityBlocks[blockHash] = struct{}{}
+		n++
 	}
 	state.requestedBlocks = make(map[chainhash.Hash]struct{})
 	return n
@@ -447,8 +579,7 @@ func (sm *SyncManager) freeAheadSlotsForPriority() {
 		if _, ok := state.requestedBlocks[item.hash]; !ok {
 			continue
 		}
-		delete(state.requestedBlocks, item.hash)
-		delete(sm.requestedBlocks, item.hash)
+		sm.unmarkPeerBlockRequest(state, item.hash)
 		// Cancelled ahead-of-tip work becomes normal scan fodder later;
 		// do not mark priority — tip gaps come first.
 		toFree--
@@ -469,7 +600,6 @@ func (sm *SyncManager) kickBlockPeer(peer *peerpkg.Peer, disconnect bool, reason
 
 	requeued := sm.requeuePeerBlockRequests(state)
 	delete(sm.blockPeers, peer)
-	state.bytesFetched = 0
 	// Prevent ensureBlockPeers from immediately re-adding this peer before
 	// Disconnect/handleDonePeerMsg finishes removing it.
 	state.syncCandidate = false
@@ -502,8 +632,14 @@ func (sm *SyncManager) kickBlockPeer(peer *peerpkg.Peer, disconnect bool, reason
 	sm.maybeGrowBlockPeerPool()
 }
 
-// handleParallelStallSample kicks stalled or clearly slow block peers and
-// replaces them. Header download still uses the single-syncPeer stall path.
+// handleParallelStallSample ejects genuinely useless block peers: ones holding
+// in-flight work but making no progress. It does NOT kick peers merely for
+// being slower than the median — under race-to-first a slow peer loses races
+// harmlessly and never drags tip, so a comparative "slowest peer" kick only
+// churned the pool (disconnect + requeue + reconnect). A multi-peer soak
+// measured 36 such kicks inflating the stall fraction to 37% (vs 21% serial)
+// and pushing the 100k wall to 47.6 min (vs 29.9 serial). Header download
+// still uses the single-syncPeer stall path.
 func (sm *SyncManager) handleParallelStallSample() {
 	if len(sm.blockPeers) == 0 {
 		return
@@ -511,9 +647,10 @@ func (sm *SyncManager) handleParallelStallSample() {
 
 	now := time.Now()
 
-	// Stall kicks first: no progress while holding in-flight work.
-	// Unproven peers (no blocks delivered) fail fast so they cannot pin
-	// tip-adjacent hashes for the full stall duration.
+	// Hard-stall kicks: a peer holding in-flight work but making no block
+	// progress. Unproven peers (no blocks delivered) fail fast at 30s so a
+	// non-serving newcomer cannot pin tip-adjacent hashes for the full
+	// stall duration; proven peers get the full maxStallDuration.
 	for _, peer := range sm.blockPeerSnapshot() {
 		state := sm.peerStates[peer]
 		if state == nil {
@@ -538,20 +675,32 @@ func (sm *SyncManager) handleParallelStallSample() {
 		sm.startSync()
 		return
 	}
+}
 
-	if now.Sub(sm.lastScoreTime) < stallSampleInterval {
+// logFetchDiagnostic emits a one-line snapshot of the fetch/validate pipeline
+// state every 5s during IBD. Used to localize stalls: if requestedBlocks is
+// empty during a stall the bug is on our side (we stopped asking); if it is
+// full and height is frozen the peer is not serving.
+func (sm *SyncManager) logFetchDiagnostic() {
+	if !sm.ibdMode || len(sm.blockPeers) == 0 {
 		return
 	}
-	sm.lastScoreTime = now
-
-	slow := sm.findSlowBlockPeer()
-	if slow == nil {
-		sm.resetBlockPeerScores()
-		return
+	tip := sm.chain.BestSnapshot()
+	_, lastHdr := sm.chain.BestHeader()
+	var perPeer []string
+	for peer := range sm.blockPeers {
+		state := sm.peerStates[peer]
+		if state == nil {
+			continue
+		}
+		perPeer = append(perPeer, fmt.Sprintf("%s inflight=%d deliv=%d",
+			peer, len(state.requestedBlocks), state.blocksDelivered))
 	}
-
-	sm.kickBlockPeer(slow, true, "slowest parallel peer")
-	sm.resetBlockPeerScores()
+	log.Infof("fetchdiag: tip=%d lasthdr=%d pendingValidate=%d "+
+		"globalRequested=%d peers[%d] %s",
+		tip.Height, lastHdr, len(sm.pendingValidate),
+		len(sm.requestedBlocks), len(sm.blockPeers),
+		strings.Join(perPeer, " "))
 }
 
 // blockPeerSnapshot copies block peer pointers for safe mutation while ranging.
@@ -561,53 +710,4 @@ func (sm *SyncManager) blockPeerSnapshot() []*peerpkg.Peer {
 		peers = append(peers, peer)
 	}
 	return peers
-}
-
-// findSlowBlockPeer returns the slowest peer when it is clearly below the
-// pool median; otherwise nil.
-func (sm *SyncManager) findSlowBlockPeer() *peerpkg.Peer {
-	type scored struct {
-		peer  *peerpkg.Peer
-		bytes uint64
-	}
-
-	scores := make([]scored, 0, len(sm.blockPeers))
-	for peer := range sm.blockPeers {
-		state := sm.peerStates[peer]
-		if state == nil {
-			continue
-		}
-		scores = append(scores, scored{peer: peer, bytes: state.bytesFetched})
-	}
-	if len(scores) < 2 {
-		return nil
-	}
-
-	sort.Slice(scores, func(i, j int) bool {
-		if scores[i].bytes != scores[j].bytes {
-			return scores[i].bytes < scores[j].bytes
-		}
-		return scores[i].peer.Addr() < scores[j].peer.Addr()
-	})
-
-	slowest := scores[0]
-	median := scores[len(scores)/2].bytes
-
-	// Need some pool progress before judging stragglers.
-	if median == 0 {
-		return nil
-	}
-	if float64(slowest.bytes) >= float64(median)*slowPeerRatio {
-		return nil
-	}
-	return slowest.peer
-}
-
-// resetBlockPeerScores clears the scoring window after a ranking pass.
-func (sm *SyncManager) resetBlockPeerScores() {
-	for peer := range sm.blockPeers {
-		if state := sm.peerStates[peer]; state != nil {
-			state.bytesFetched = 0
-		}
-	}
 }

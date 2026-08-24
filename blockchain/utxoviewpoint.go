@@ -5,7 +5,11 @@
 package blockchain
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"sort"
 
 	"github.com/btcsuite/btcd/btcutil/v2"
 	"github.com/btcsuite/btcd/chainhash/v2"
@@ -69,6 +73,12 @@ func (entry *UtxoEntry) isModified() bool {
 // been stored in the database.
 func (entry *UtxoEntry) isFresh() bool {
 	return entry.packedFlags&tfFresh == tfFresh
+}
+
+// markFlushed clears fresh/modified so a just-persisted unspent entry can stay
+// in the cache as a clean hit.
+func (entry *UtxoEntry) markFlushed() {
+	entry.packedFlags &^= tfModified | tfFresh
 }
 
 // memoryUsage returns the memory usage in bytes of for the utxo entry.
@@ -180,6 +190,79 @@ func (view *UtxoViewpoint) SetBestHash(hash *chainhash.Hash) {
 // disconnected during a reorg.
 func (view *UtxoViewpoint) LookupEntry(outpoint wire.OutPoint) *UtxoEntry {
 	return view.entries[outpoint]
+}
+
+// Clone returns a deep copy of the view (best hash + every entry). Used by the
+// IBD depth-1 pipeline so script verification can read a stable snapshot while
+// the live view is soft-connected forward.
+func (view *UtxoViewpoint) Clone() *UtxoViewpoint {
+	if view == nil {
+		return nil
+	}
+	cloned := NewUtxoViewpoint()
+	cloned.bestHash = view.bestHash
+	for op, entry := range view.entries {
+		if entry == nil {
+			cloned.entries[op] = nil
+			continue
+		}
+		cloned.entries[op] = entry.Clone()
+	}
+	return cloned
+}
+
+// Fingerprint returns a deterministic hash of the view's unspent-UTXO state.
+// Two views produce the same fingerprint iff they hold the same set of unspent
+// outputs with identical amount, pkScript, block height, and coinbase flag.
+// Spent and nil entries are skipped.
+//
+// This is the consensus-equivalence primitive for the parallel-validation
+// gate and the fullvaltip bench: SERIAL / DEPTH1 / BATCH must all produce
+// the same fingerprint on the same window, proving the parallel pipeline
+// mutates the UTXO set identically to serial validation.
+func (view *UtxoViewpoint) Fingerprint() chainhash.Hash {
+	var out chainhash.Hash
+	if view == nil {
+		return out
+	}
+
+	keys := make([]wire.OutPoint, 0, len(view.entries))
+	for op, entry := range view.entries {
+		if entry == nil || entry.IsSpent() {
+			continue
+		}
+		keys = append(keys, op)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if c := bytes.Compare(keys[i].Hash[:], keys[j].Hash[:]); c != 0 {
+			return c < 0
+		}
+		return keys[i].Index < keys[j].Index
+	})
+
+	h := sha256.New()
+	var b8 [8]byte
+	var b4 [4]byte
+	for _, op := range keys {
+		entry := view.entries[op]
+		h.Write(op.Hash[:])
+		binary.LittleEndian.PutUint32(b4[:], op.Index)
+		h.Write(b4[:])
+		binary.LittleEndian.PutUint64(b8[:], uint64(entry.Amount()))
+		h.Write(b8[:])
+		binary.LittleEndian.PutUint32(b4[:], uint32(entry.BlockHeight()))
+		h.Write(b4[:])
+		var flags byte
+		if entry.IsCoinBase() {
+			flags = 1
+		}
+		h.Write([]byte{flags})
+		binary.LittleEndian.PutUint32(b4[:], uint32(len(entry.PkScript())))
+		h.Write(b4[:])
+		h.Write(entry.PkScript())
+	}
+	copy(out[:], h.Sum(nil))
+	return out
 }
 
 // FetchPrevOutput fetches the previous output referenced by the passed
